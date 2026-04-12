@@ -1,6 +1,7 @@
 const SNAPSHOT_MAX_AGE_SECONDS = 60;
 const PREFERRED_MAX_AGE_SECONDS = 30;
 const FALLBACK_HTML_MAX_AGE_SECONDS = 600;
+const HOMEPAGE_CACHE_GENERATED_AT_HEADER = 'X-Uptimer-Generated-At';
 
 function acceptsHtml(request) {
   const accept = request.headers.get('Accept') || '';
@@ -18,6 +19,13 @@ function escapeHtml(value) {
 
 function safeJsonForInlineScript(value) {
   return JSON.stringify(value).replace(/</g, '\\u003c');
+}
+
+function readGeneratedAtHeader(res) {
+  const raw = res.headers.get(HOMEPAGE_CACHE_GENERATED_AT_HEADER);
+  if (!raw) return null;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function normalizeSnapshotText(value, fallback) {
@@ -221,21 +229,29 @@ export default {
     const isStatusPage = url.pathname === '/' || url.pathname === '/index.html';
     if (wantsHtml && isStatusPage) {
       const cacheKey = new Request(url.origin + '/', { method: 'GET' });
-      const fallbackCacheKey = new Request(url.origin + '/__uptimer_homepage_fallback__', {
-        method: 'GET',
-      });
       const cached = await caches.default.match(cacheKey);
-      if (cached) return cached;
+      const now = Math.floor(Date.now() / 1000);
+      if (cached) {
+        const cachedGeneratedAt = readGeneratedAtHeader(cached);
+        if (cachedGeneratedAt === null) {
+          return cached;
+        }
+
+        const cachedAge = Math.max(0, now - cachedGeneratedAt);
+        if (cachedAge <= SNAPSHOT_MAX_AGE_SECONDS) {
+          const hit = cached.clone();
+          hit.headers.set('Cache-Control', computeCacheControl(cachedAge));
+          hit.headers.delete(HOMEPAGE_CACHE_GENERATED_AT_HEADER);
+          return hit;
+        }
+      }
 
       const base = await fetchIndexHtml(env, url);
       const html = await base.text();
 
       const artifact = await fetchPublicHomepageArtifact(env);
       if (!artifact) {
-        const fallback = await caches.default.match(fallbackCacheKey);
-        if (fallback) {
-          return fallback;
-        }
+        if (cached) return cached;
 
         const headers = new Headers(base.headers);
         headers.set('Content-Type', 'text/html; charset=utf-8');
@@ -245,7 +261,6 @@ export default {
         return new Response(html, { status: 200, headers });
       }
 
-      const now = Math.floor(Date.now() / 1000);
       const generatedAt = typeof artifact.generated_at === 'number' ? artifact.generated_at : now;
       const age = Math.max(0, now - generatedAt);
 
@@ -269,16 +284,12 @@ export default {
 
       const resp = new Response(injected, { status: 200, headers });
 
-      const fallbackHeaders = new Headers(headers);
-      fallbackHeaders.set('Cache-Control', `public, max-age=${FALLBACK_HTML_MAX_AGE_SECONDS}`);
-      const fallbackResp = new Response(injected, { status: 200, headers: fallbackHeaders });
+      const cacheHeaders = new Headers(headers);
+      cacheHeaders.set('Cache-Control', `public, max-age=${FALLBACK_HTML_MAX_AGE_SECONDS}`);
+      cacheHeaders.set(HOMEPAGE_CACHE_GENERATED_AT_HEADER, `${generatedAt}`);
+      const cacheResp = new Response(injected, { status: 200, headers: cacheHeaders });
 
-      ctx.waitUntil(
-        Promise.all([
-          caches.default.put(cacheKey, resp.clone()),
-          caches.default.put(fallbackCacheKey, fallbackResp),
-        ]),
-      );
+      ctx.waitUntil(caches.default.put(cacheKey, cacheResp));
       return resp;
     }
 

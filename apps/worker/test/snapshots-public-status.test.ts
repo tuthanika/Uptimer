@@ -6,6 +6,7 @@ import {
   getSnapshotKey,
   getSnapshotMaxAgeSeconds,
   readStatusSnapshot,
+  readStatusSnapshotJson,
   toSnapshotPayload,
   writeStatusSnapshot,
 } from '../src/snapshots/public-status';
@@ -88,6 +89,47 @@ describe('snapshots/public-status', () => {
     await expect(readStatusSnapshot(invalidJsonDb, 200)).resolves.toBeNull();
     expect(warn).toHaveBeenCalled();
     warn.mockRestore();
+  });
+
+  it('serves the raw snapshot JSON when it looks complete', async () => {
+    const now = 200;
+    const payload = samplePayload(190);
+    const bodyJson = JSON.stringify(payload);
+    const db = createFakeD1Database([
+      {
+        match: 'from public_snapshots',
+        first: () => ({
+          generated_at: payload.generated_at,
+          body_json: bodyJson,
+        }),
+      },
+    ]);
+
+    await expect(readStatusSnapshotJson(db, now)).resolves.toEqual({
+      bodyJson,
+      age: 10,
+    });
+  });
+
+  it('rejects truncated snapshot JSON even if it matches the fast-path heuristic', async () => {
+    const now = 200;
+    const payload = samplePayload(190);
+    const bodyJson = JSON.stringify(payload);
+    const truncated = bodyJson.slice(0, -1);
+    expect(truncated.startsWith('{"generated_at":')).toBe(true);
+    expect(truncated.includes('"site_title"')).toBe(true);
+
+    const db = createFakeD1Database([
+      {
+        match: 'from public_snapshots',
+        first: () => ({
+          generated_at: payload.generated_at,
+          body_json: truncated,
+        }),
+      },
+    ]);
+
+    await expect(readStatusSnapshotJson(db, now)).resolves.toBeNull();
   });
 
   it('writes the normalized snapshot payload with upsert semantics', async () => {
