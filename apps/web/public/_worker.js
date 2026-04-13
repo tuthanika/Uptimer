@@ -98,6 +98,15 @@ function computeCacheControl(ageSeconds) {
   return `public, max-age=${maxAge}, stale-while-revalidate=${stale}, stale-if-error=${stale}`;
 }
 
+function buildHomepageCacheHit(cached, ageSeconds) {
+  // In the Cloudflare runtime, cached/fetched Responses can have immutable headers.
+  // Always rebuild before mutating.
+  const hit = new Response(cached.body, cached);
+  hit.headers.set('Cache-Control', computeCacheControl(ageSeconds));
+  hit.headers.delete(HOMEPAGE_CACHE_GENERATED_AT_HEADER);
+  return hit;
+}
+
 function upsertHeadTag(html, pattern, tag) {
   if (pattern.test(html)) {
     return html.replace(pattern, tag);
@@ -170,6 +179,11 @@ function injectStatusMetaTags(html, artifact, url) {
   return injected;
 }
 
+function buildMinimalIndexHtml(title = 'Uptimer') {
+  const escapedTitle = escapeHtml(title);
+  return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>${escapedTitle}</title></head><body><div id="root"></div></body></html>`;
+}
+
 async function fetchIndexHtml(env, url) {
   const indexUrl = new URL('/index.html', url);
 
@@ -220,29 +234,39 @@ async function fetchPublicHomepageArtifact(env) {
 
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
+    try {
+      try {
+        ctx.passThroughOnException?.();
+      } catch {
+        // ignore
+      }
 
-    // HTML requests: serve SPA entry for client-side routes.
-    const wantsHtml = request.method === 'GET' && acceptsHtml(request);
+      const url = new URL(request.url);
 
-    // Special-case the status page for HTML injection.
-    const isStatusPage = url.pathname === '/' || url.pathname === '/index.html';
-    if (wantsHtml && isStatusPage) {
-      const cacheKey = new Request(url.origin + '/', { method: 'GET' });
-      const cached = await caches.default.match(cacheKey);
-      const now = Math.floor(Date.now() / 1000);
-      if (cached) {
-        const cachedGeneratedAt = readGeneratedAtHeader(cached);
-        if (cachedGeneratedAt === null) {
-          return cached;
+      // HTML requests: serve SPA entry for client-side routes.
+      const wantsHtml = request.method === 'GET' && acceptsHtml(request);
+
+      // Special-case the status page for HTML injection.
+      const isStatusPage = url.pathname === '/' || url.pathname === '/index.html';
+      if (wantsHtml && isStatusPage) {
+        const cacheKey = new Request(url.origin + '/', { method: 'GET' });
+        let cached = null;
+        try {
+          cached = await caches.default.match(cacheKey);
+        } catch {
+          cached = null;
         }
+
+        const now = Math.floor(Date.now() / 1000);
+        if (cached) {
+          const cachedGeneratedAt = readGeneratedAtHeader(cached);
+          if (cachedGeneratedAt === null) {
+            return cached;
+          }
 
         const cachedAge = Math.max(0, now - cachedGeneratedAt);
         if (cachedAge <= SNAPSHOT_MAX_AGE_SECONDS) {
-          const hit = cached.clone();
-          hit.headers.set('Cache-Control', computeCacheControl(cachedAge));
-          hit.headers.delete(HOMEPAGE_CACHE_GENERATED_AT_HEADER);
-          return hit;
+          return buildHomepageCacheHit(cached, cachedAge);
         }
       }
 
@@ -251,9 +275,68 @@ export default {
 
       const artifact = await fetchPublicHomepageArtifact(env);
       if (!artifact) {
-        if (cached) return cached;
+        if (cached) {
+          const cachedGeneratedAt = readGeneratedAtHeader(cached);
+          if (cachedGeneratedAt === null) return cached;
+          return buildHomepageCacheHit(cached, Math.max(0, now - cachedGeneratedAt));
+        }
 
         const headers = new Headers(base.headers);
+        headers.set('Content-Type', 'text/html; charset=utf-8');
+        headers.append('Vary', 'Accept');
+        headers.delete('Location');
+
+          return new Response(html, { status: 200, headers });
+        }
+
+        const generatedAt =
+          typeof artifact.generated_at === 'number' ? artifact.generated_at : now;
+        const age = Math.max(0, now - generatedAt);
+
+        let injected = html.replace(
+          '<div id="root"></div>',
+          `${artifact.preload_html}<div id="root"></div>`,
+        );
+
+        injected = injectStatusMetaTags(injected, artifact, url);
+
+        injected = injected.replace(
+          '</head>',
+          `  ${HOMEPAGE_PRELOAD_STYLE_TAG}\n  <script>globalThis.__UPTIMER_INITIAL_HOMEPAGE__=${safeJsonForInlineScript(artifact.snapshot)};</script>\n</head>`,
+        );
+
+        const headers = new Headers(base.headers);
+        headers.set('Content-Type', 'text/html; charset=utf-8');
+        headers.set('Cache-Control', computeCacheControl(age));
+        headers.append('Vary', 'Accept');
+        headers.delete('Location');
+
+        const resp = new Response(injected, { status: 200, headers });
+
+        const cacheHeaders = new Headers(headers);
+        cacheHeaders.set('Cache-Control', `public, max-age=${FALLBACK_HTML_MAX_AGE_SECONDS}`);
+        cacheHeaders.set(HOMEPAGE_CACHE_GENERATED_AT_HEADER, `${generatedAt}`);
+        cacheHeaders.delete('Set-Cookie');
+        const cacheResp = new Response(injected, { status: 200, headers: cacheHeaders });
+
+        try {
+          ctx.waitUntil(caches.default.put(cacheKey, cacheResp).catch(() => undefined));
+        } catch {
+          // Ignore cache write failures. The injected HTML response is still usable and
+          // the worker should never throw a 1101 just because the cache rejected a put.
+        }
+        return resp;
+      }
+
+      // Default: serve static assets.
+      const assetResp = await env.ASSETS.fetch(request);
+
+      // SPA fallback for client-side routes.
+      if (wantsHtml && assetResp.status === 404) {
+        const indexResp = await fetchIndexHtml(env, url);
+        const html = await indexResp.text();
+
+        const headers = new Headers(indexResp.headers);
         headers.set('Content-Type', 'text/html; charset=utf-8');
         headers.append('Vary', 'Accept');
         headers.delete('Location');
@@ -261,54 +344,63 @@ export default {
         return new Response(html, { status: 200, headers });
       }
 
-      const generatedAt = typeof artifact.generated_at === 'number' ? artifact.generated_at : now;
-      const age = Math.max(0, now - generatedAt);
+      return assetResp;
+    } catch (err) {
+      try {
+        console.error('pages worker: unhandled error', err);
+      } catch {
+        // ignore
+      }
 
-      let injected = html.replace(
-        '<div id="root"></div>',
-        `${artifact.preload_html}<div id="root"></div>`,
-      );
+      // Best-effort fallback for HTML navigation so we never surface a 1101.
+      try {
+        const wantsHtml = request.method === 'GET' && acceptsHtml(request);
+        const url = new URL(request.url);
+        const isStatusPage = url.pathname === '/' || url.pathname === '/index.html';
 
-      injected = injectStatusMetaTags(injected, artifact, url);
+        if (wantsHtml) {
+          if (isStatusPage) {
+            try {
+              const cacheKey = new Request(url.origin + '/', { method: 'GET' });
+              const cached = await caches.default.match(cacheKey);
+              if (cached) {
+                const now = Math.floor(Date.now() / 1000);
+                const cachedGeneratedAt = readGeneratedAtHeader(cached);
+                if (cachedGeneratedAt === null) return cached;
+                return buildHomepageCacheHit(cached, Math.max(0, now - cachedGeneratedAt));
+              }
+            } catch {
+              // ignore
+            }
+          }
 
-      injected = injected.replace(
-        '</head>',
-        `  ${HOMEPAGE_PRELOAD_STYLE_TAG}\n  <script>globalThis.__UPTIMER_INITIAL_HOMEPAGE__=${safeJsonForInlineScript(artifact.snapshot)};</script>\n</head>`,
-      );
+          try {
+            const indexResp = await fetchIndexHtml(env, url);
+            const html = await indexResp.text();
+            const headers = new Headers(indexResp.headers);
+            headers.set('Content-Type', 'text/html; charset=utf-8');
+            headers.append('Vary', 'Accept');
+            headers.delete('Location');
+            headers.set('Cache-Control', 'no-store');
+            return new Response(html, { status: 200, headers });
+          } catch {
+            // ignore
+          }
 
-      const headers = new Headers(base.headers);
-      headers.set('Content-Type', 'text/html; charset=utf-8');
-      headers.set('Cache-Control', computeCacheControl(age));
-      headers.append('Vary', 'Accept');
-      headers.delete('Location');
+          return new Response(buildMinimalIndexHtml('Uptimer'), {
+            status: 200,
+            headers: {
+              'Content-Type': 'text/html; charset=utf-8',
+              'Cache-Control': 'no-store',
+              Vary: 'Accept',
+            },
+          });
+        }
+      } catch {
+        // ignore
+      }
 
-      const resp = new Response(injected, { status: 200, headers });
-
-      const cacheHeaders = new Headers(headers);
-      cacheHeaders.set('Cache-Control', `public, max-age=${FALLBACK_HTML_MAX_AGE_SECONDS}`);
-      cacheHeaders.set(HOMEPAGE_CACHE_GENERATED_AT_HEADER, `${generatedAt}`);
-      const cacheResp = new Response(injected, { status: 200, headers: cacheHeaders });
-
-      ctx.waitUntil(caches.default.put(cacheKey, cacheResp));
-      return resp;
+      return new Response('Internal Server Error', { status: 500 });
     }
-
-    // Default: serve static assets.
-    const assetResp = await env.ASSETS.fetch(request);
-
-    // SPA fallback for client-side routes.
-    if (wantsHtml && assetResp.status === 404) {
-      const indexResp = await fetchIndexHtml(env, url);
-      const html = await indexResp.text();
-
-      const headers = new Headers(indexResp.headers);
-      headers.set('Content-Type', 'text/html; charset=utf-8');
-      headers.append('Vary', 'Accept');
-      headers.delete('Location');
-
-      return new Response(html, { status: 200, headers });
-    }
-
-    return assetResp;
   },
 };

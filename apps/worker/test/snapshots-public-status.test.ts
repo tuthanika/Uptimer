@@ -132,6 +132,32 @@ describe('snapshots/public-status', () => {
     await expect(readStatusSnapshotJson(db, now)).resolves.toBeNull();
   });
 
+  it('rejects corrupted snapshot JSON even if it matches substring heuristics', async () => {
+    const now = 200;
+    const payload = samplePayload(190);
+    const bodyJson = JSON.stringify(payload);
+    const corrupted = bodyJson.replace(
+      `"generated_at":${payload.generated_at}`,
+      `"generated_at":NaN`,
+    );
+    expect(corrupted.startsWith('{"generated_at":')).toBe(true);
+    expect(corrupted.includes('"site_title"')).toBe(true);
+    expect(corrupted.includes('"overall_status"')).toBe(true);
+    expect(corrupted.endsWith('}')).toBe(true);
+
+    const db = createFakeD1Database([
+      {
+        match: 'from public_snapshots',
+        first: () => ({
+          generated_at: payload.generated_at,
+          body_json: corrupted,
+        }),
+      },
+    ]);
+
+    await expect(readStatusSnapshotJson(db, now)).resolves.toBeNull();
+  });
+
   it('writes the normalized snapshot payload with upsert semantics', async () => {
     let boundArgs: unknown[] | null = null;
     const db = createFakeD1Database([

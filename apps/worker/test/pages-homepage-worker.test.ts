@@ -4,8 +4,13 @@ import pageWorker from '../../web/public/_worker.js';
 
 type CacheMatcher = (request: Request) => Response | undefined;
 
-function installDefaultCacheMock(match: CacheMatcher) {
-  const put = vi.fn(async () => undefined);
+function installDefaultCacheMock(
+  match: CacheMatcher,
+  opts: { putImpl?: (request: Request, response: Response) => Promise<void> | void } = {},
+) {
+  const put = vi.fn(async (request: Request, response: Response) => {
+    await opts.putImpl?.(request, response);
+  });
 
   Object.defineProperty(globalThis, 'caches', {
     configurable: true,
@@ -169,5 +174,67 @@ describe('pages homepage worker', () => {
     expect(html).not.toContain('__UPTIMER_INITIAL_STATUS__');
     expect(html).toContain('artifact preload');
     expect(put).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not throw when the html cache put fails and strips set-cookie from cached response', async () => {
+    const { put } = installDefaultCacheMock(() => undefined, {
+      putImpl: () => {
+        throw new Error('cache rejected put');
+      },
+    });
+    const env = makeEnv();
+    env.ASSETS.fetch = vi.fn(async () => new Response('<!doctype html><html><head></head><body><div id="root"></div></body></html>', {
+      status: 200,
+      headers: { 'Set-Cookie': 'cf=1' },
+    }));
+
+    globalThis.fetch = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          generated_at: 1_728_000_000,
+          preload_html: '<div id="uptimer-preload"><main>artifact preload</main></div>',
+          snapshot: { site_title: 'Status Hub' },
+          meta_title: 'Status Hub',
+          meta_description: 'Production',
+        }),
+        { status: 200 },
+      ),
+    ) as never;
+
+    const res = await pageWorker.fetch(
+      new Request('https://status.example.com/', {
+        headers: { Accept: 'text/html' },
+      }),
+      env,
+      { waitUntil: vi.fn((promise) => promise) },
+    );
+
+    const html = await res.text();
+    expect(html).toContain('__UPTIMER_INITIAL_HOMEPAGE__');
+    expect(html).toContain('artifact preload');
+    expect(put).toHaveBeenCalledTimes(1);
+
+    const cachedResponse = vi.mocked(put).mock.calls[0]?.[1];
+    expect(cachedResponse?.headers.get('Set-Cookie')).toBeNull();
+  });
+
+  it('never throws a 1101 for HTML navigations when the asset pipeline errors', async () => {
+    installDefaultCacheMock(() => undefined);
+    const env = makeEnv();
+    env.ASSETS.fetch = vi.fn(async () => {
+      throw new Error('asset fetch failed');
+    });
+
+    const res = await pageWorker.fetch(
+      new Request('https://status.example.com/', {
+        headers: { Accept: 'text/html' },
+      }),
+      env,
+      { waitUntil: vi.fn() },
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Content-Type')).toContain('text/html');
+    expect(await res.text()).toContain('<div id="root"></div>');
   });
 });

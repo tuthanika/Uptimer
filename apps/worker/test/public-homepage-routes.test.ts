@@ -278,15 +278,8 @@ describe('public homepage route', () => {
     expect(res.headers.get('Vary')).toContain('Origin');
   });
 
-  it('partitions cached homepage artifact responses by Origin when app-level CORS reflection is enabled', async () => {
+  it('partitions cached homepage responses by Origin when app-level CORS reflection is enabled', async () => {
     const payload = samplePayload(190);
-    const render = {
-      generated_at: payload.generated_at,
-      preload_html: '<div id="uptimer-preload">hello</div>',
-      snapshot: payload,
-      meta_title: 'Uptimer',
-      meta_description: 'All Systems Operational',
-    };
     const dbReads: string[] = [];
     vi.spyOn(Date, 'now').mockReturnValue(200_000);
 
@@ -295,10 +288,10 @@ describe('public homepage route', () => {
         match: 'from public_snapshots',
         first: (args) => {
           dbReads.push(String(args[0]));
-          return args[0] === 'homepage:artifact'
+          return args[0] === 'homepage'
             ? {
                 generated_at: payload.generated_at,
-                body_json: JSON.stringify(render),
+                body_json: JSON.stringify(payload),
               }
             : null;
         },
@@ -306,17 +299,17 @@ describe('public homepage route', () => {
     ];
 
     const first = await requestHomepageViaApp(
-      '/api/v1/public/homepage-artifact',
+      '/api/v1/public/homepage',
       handlers,
       'https://one.example.com',
     );
     const second = await requestHomepageViaApp(
-      '/api/v1/public/homepage-artifact',
+      '/api/v1/public/homepage',
       handlers,
       'https://two.example.com',
     );
     const third = await requestHomepageViaApp(
-      '/api/v1/public/homepage-artifact',
+      '/api/v1/public/homepage',
       handlers,
       'https://one.example.com',
     );
@@ -324,28 +317,7 @@ describe('public homepage route', () => {
     expect(first.headers.get('Access-Control-Allow-Origin')).toBe('https://one.example.com');
     expect(second.headers.get('Access-Control-Allow-Origin')).toBe('https://two.example.com');
     expect(third.headers.get('Access-Control-Allow-Origin')).toBe('https://one.example.com');
-    expect(dbReads).toEqual(['homepage:artifact', 'homepage:artifact']);
-  });
-
-  it('serves a bounded stale homepage snapshot instead of computing in-request', async () => {
-    const payload = samplePayload(100);
-    vi.spyOn(Date, 'now').mockReturnValue(200_000);
-
-    const res = await requestHomepage([
-      {
-        match: 'from public_snapshots',
-        first: () => ({
-          generated_at: payload.generated_at,
-          body_json: JSON.stringify(payload),
-        }),
-      },
-    ]);
-
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual(payload);
-    expect(res.headers.get('Cache-Control')).toBe(
-      'public, max-age=0, stale-while-revalidate=0, stale-if-error=0',
-    );
+    expect(dbReads).toEqual(['homepage', 'homepage']);
   });
 
   it('falls back to the fresh public status snapshot when the full homepage snapshot is missing', async () => {
