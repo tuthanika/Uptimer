@@ -49,7 +49,7 @@ function formatTime(tsSec: number, cache?: Map<number, string>): string {
 
   let formatted = '';
   try {
-    formatted = new Date(tsSec * 1000).toLocaleString();
+    formatted = new Date(tsSec * 1000).toISOString().replace('T', ' ').replace('.000Z', 'Z');
   } catch {
     formatted = '';
   }
