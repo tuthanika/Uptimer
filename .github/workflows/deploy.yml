@@ -304,6 +304,16 @@ jobs:
             echo "worker_url=$worker_url" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Upsert Worker secret for self origin (best-effort)
+        if: ${{ steps.deploy_worker.outputs.worker_url != '' }}
+        shell: bash
+        working-directory: apps/worker
+        run: |
+          set -euo pipefail
+          printf '%s' "$WORKER_URL" | pnpm exec wrangler secret put UPTIMER_SELF_ORIGIN --name "$WORKER_NAME" --config "$WRANGLER_CI_CONFIG"
+        env:
+          WORKER_URL: ${{ steps.deploy_worker.outputs.worker_url }}
+
       - name: Warm public status snapshot (best-effort)
         if: ${{ steps.deploy_worker.outputs.worker_url != '' }}
         shell: bash

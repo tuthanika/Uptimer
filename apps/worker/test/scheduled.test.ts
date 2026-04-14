@@ -203,6 +203,8 @@ describe('scheduler/scheduled regression', () => {
 
     expect(acquireLease).toHaveBeenCalledWith(env.DB, 'scheduler:tick', expectedNow, 55);
     expect(readSettings).toHaveBeenCalledTimes(1);
+    expect(waitUntil).toHaveBeenCalledTimes(1);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
     expect(refreshPublicHomepageSnapshot).toHaveBeenCalledWith({
       db: env.DB,
       now: expectedNow,
@@ -212,7 +214,34 @@ describe('scheduler/scheduled regression', () => {
     expect(refreshArgs).toBeDefined();
     await refreshArgs?.compute();
     expect(computePublicHomepagePayload).toHaveBeenCalledWith(env.DB, expectedNow);
-    expect(waitUntil).toHaveBeenCalledTimes(1);
+  });
+
+  it('self-invokes homepage refresh when UPTIMER_SELF_ORIGIN is configured', async () => {
+    const env = createEnv({ dueRows: [] }) as unknown as Env;
+    env.UPTIMER_SELF_ORIGIN = 'https://self.example.com';
+    env.ADMIN_TOKEN = 'test-admin-token';
+    const waitUntil = vi.fn();
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response('ok', { status: 200 }));
+
+    try {
+      await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+
+      expect(waitUntil).toHaveBeenCalledTimes(1);
+      await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+      expect(fetchSpy).toHaveBeenCalledWith(
+        'https://self.example.com/api/v1/internal/refresh/homepage',
+        expect.objectContaining({
+          method: 'POST',
+          body: 'test-admin-token',
+        }),
+      );
+      expect(refreshPublicHomepageSnapshot).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it('logs homepage snapshot refresh failures without breaking the tick', async () => {
@@ -309,8 +338,9 @@ describe('scheduler/scheduled regression', () => {
     expect(runArgs[stateUpsertIndex]?.[1]).toBe('up');
     expect(runArgs[stateUpsertIndex]?.[2]).toBe(expectedCheckedAt);
 
-    expect(refreshPublicHomepageSnapshot).toHaveBeenCalledTimes(1);
     expect(waitUntil).toHaveBeenCalledTimes(1);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+    expect(refreshPublicHomepageSnapshot).toHaveBeenCalledTimes(1);
   });
 
   it('passes explicit response assertion modes through scheduled HTTP checks', async () => {

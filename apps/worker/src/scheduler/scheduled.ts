@@ -21,8 +21,6 @@ import {
 import { runTcpCheck } from '../monitor/tcp';
 import type { CheckOutcome } from '../monitor/types';
 import { dispatchWebhookToChannels, type WebhookChannel } from '../notify/webhook';
-import { computePublicHomepagePayload } from '../public/homepage';
-import { refreshPublicHomepageSnapshot } from '../snapshots';
 import { readSettings } from '../settings';
 import { acquireLease } from './lock';
 
@@ -34,6 +32,49 @@ const PERSIST_BATCH_SIZE = 25;
 
 // Look back a bit so maintenance start/end notifications are not missed if a tick is delayed.
 const MAINTENANCE_EVENT_LOOKBACK_SECONDS = 10 * 60;
+
+function normalizeSelfOrigin(value: string | undefined): string | null {
+  const trimmed = value?.trim() ?? '';
+  if (!trimmed) return null;
+
+  let out = trimmed;
+  while (out.endsWith('/')) out = out.slice(0, -1);
+  if (!out.startsWith('http://') && !out.startsWith('https://')) return null;
+  return out;
+}
+
+async function refreshHomepageSnapshotViaSelfFetch(env: Env): Promise<void> {
+  const origin = normalizeSelfOrigin(env.UPTIMER_SELF_ORIGIN);
+  if (!origin || !env.ADMIN_TOKEN) {
+    throw new Error('UPTIMER_SELF_ORIGIN or ADMIN_TOKEN missing');
+  }
+
+  const res = await fetch(`${origin}/api/v1/internal/refresh/homepage`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+    },
+    cache: 'no-store',
+    body: env.ADMIN_TOKEN,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`self refresh failed: HTTP ${res.status} ${text}`.trim());
+  }
+}
+
+async function refreshHomepageSnapshotInline(env: Env, now: number): Promise<void> {
+  const [{ computePublicHomepagePayload }, { refreshPublicHomepageSnapshot }] = await Promise.all([
+    import('../public/homepage'),
+    import('../snapshots'),
+  ]);
+
+  await refreshPublicHomepageSnapshot({
+    db: env.DB,
+    now,
+    compute: () => computePublicHomepagePayload(env.DB, now),
+  });
+}
 
 type CachedMonitorHttpJson = {
   http_headers_json: string | null;
@@ -669,16 +710,15 @@ function queueMonitorNotification(
 export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
   const checkedAt = Math.floor(now / 60) * 60;
+  const shouldSelfRefresh = normalizeSelfOrigin(env.UPTIMER_SELF_ORIGIN) !== null && !!env.ADMIN_TOKEN;
   const queueHomepageRefresh = () =>
-    refreshPublicHomepageSnapshot({
-      db: env.DB,
-      now,
-      compute: async () => {
-        return computePublicHomepagePayload(env.DB, now);
-      },
-    }).catch((err) => {
-      console.warn('homepage snapshot: refresh failed', err);
-    });
+    shouldSelfRefresh
+      ? refreshHomepageSnapshotViaSelfFetch(env).catch((err) => {
+          console.warn('homepage snapshot: self refresh failed', err);
+        })
+      : refreshHomepageSnapshotInline(env, now).catch((err) => {
+          console.warn('homepage snapshot: refresh failed', err);
+        });
 
   const acquired = await acquireLease(env.DB, LOCK_NAME, now, LOCK_LEASE_SECONDS);
   if (!acquired) {
