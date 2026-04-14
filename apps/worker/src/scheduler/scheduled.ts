@@ -583,31 +583,40 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
     }
   }
 
-  if (rejected.length > 0) {
-    let httpCount = 0;
-    let tcpCount = 0;
-    let assertionCount = 0;
-    let attemptTotal = 0;
-    let downCount = 0;
-    let unknownCount = 0;
-    for (const monitor of completed) {
-      attemptTotal += monitor.outcome.attempts;
-      if (monitor.outcome.status === 'down') downCount += 1;
-      else if (monitor.outcome.status === 'unknown') unknownCount += 1;
+  if (rejected.length === 0 && completed.every((monitor) => monitor.outcome.status === 'up')) {
+    ctx.waitUntil(queueHomepageRefresh());
+    return;
+  }
 
-      if (monitor.row.type === 'http') {
-        httpCount += 1;
-        if (monitor.row.response_keyword || monitor.row.response_forbidden_keyword) {
-          assertionCount += 1;
-        }
-      } else if (monitor.row.type === 'tcp') {
-        tcpCount += 1;
+  let httpCount = 0;
+  let tcpCount = 0;
+  let assertionCount = 0;
+  let attemptTotal = 0;
+  let downCount = 0;
+  let unknownCount = 0;
+  for (const monitor of completed) {
+    attemptTotal += monitor.outcome.attempts;
+    if (monitor.outcome.status === 'down') downCount += 1;
+    else if (monitor.outcome.status === 'unknown') unknownCount += 1;
+
+    if (monitor.row.type === 'http') {
+      httpCount += 1;
+      if (monitor.row.response_keyword || monitor.row.response_forbidden_keyword) {
+        assertionCount += 1;
       }
+    } else if (monitor.row.type === 'tcp') {
+      tcpCount += 1;
     }
+  }
 
+  if (rejected.length > 0) {
     console.error(
       `scheduled: ${rejected.length}/${settled.length} monitors failed at ${checkedAt} attempts=${attemptTotal} http=${httpCount} tcp=${tcpCount} assertions=${assertionCount} down=${downCount} unknown=${unknownCount}`,
       rejected[0],
+    );
+  } else if (downCount > 0 || unknownCount > 0) {
+    console.warn(
+      `scheduled: processed ${settled.length} monitors at ${checkedAt} attempts=${attemptTotal} http=${httpCount} tcp=${tcpCount} assertions=${assertionCount} down=${downCount} unknown=${unknownCount}`,
     );
   }
 
