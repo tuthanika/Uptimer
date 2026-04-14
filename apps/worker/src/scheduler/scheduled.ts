@@ -583,6 +583,11 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
     }
   }
 
+  if (rejected.length === 0 && completed.every((monitor) => monitor.outcome.status === 'up')) {
+    ctx.waitUntil(queueHomepageRefresh());
+    return;
+  }
+
   let httpCount = 0;
   let tcpCount = 0;
   let assertionCount = 0;
@@ -609,8 +614,8 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
       `scheduled: ${rejected.length}/${settled.length} monitors failed at ${checkedAt} attempts=${attemptTotal} http=${httpCount} tcp=${tcpCount} assertions=${assertionCount} down=${downCount} unknown=${unknownCount}`,
       rejected[0],
     );
-  } else {
-    console.log(
+  } else if (downCount > 0 || unknownCount > 0) {
+    console.warn(
       `scheduled: processed ${settled.length} monitors at ${checkedAt} attempts=${attemptTotal} http=${httpCount} tcp=${tcpCount} assertions=${assertionCount} down=${downCount} unknown=${unknownCount}`,
     );
   }
