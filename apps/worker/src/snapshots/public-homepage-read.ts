@@ -26,6 +26,8 @@ const normalizedHomepageArtifactCacheByDb = new WeakMap<
   D1Database,
   Map<SnapshotKey, NormalizedSnapshotRow>
 >();
+const normalizedHomepagePayloadCacheGlobal = new Map<SnapshotKey, RawNormalizedSnapshotRow>();
+const normalizedHomepageArtifactCacheGlobal = new Map<SnapshotKey, RawNormalizedSnapshotRow>();
 
 type SnapshotRefreshRow = {
   key: SnapshotKey;
@@ -44,6 +46,10 @@ type NormalizedSnapshotRow = {
   generatedAt: number;
   updatedAt: number;
   bodyJson: string;
+};
+
+type RawNormalizedSnapshotRow = NormalizedSnapshotRow & {
+  rawBodyJson: string;
 };
 
 type ParsedJsonText = {
@@ -199,6 +205,39 @@ function writeCachedNormalizedSnapshotRow(
   return row;
 }
 
+function readCachedNormalizedSnapshotRowGlobal(
+  cache: ReadonlyMap<SnapshotKey, RawNormalizedSnapshotRow>,
+  candidate: SnapshotCandidate,
+  rawBodyJson: string,
+): NormalizedSnapshotRow | null {
+  const row = cache.get(candidate.key);
+  if (!row) {
+    return null;
+  }
+
+  return row.generatedAt === candidate.generatedAt &&
+    row.updatedAt === candidate.updatedAt &&
+    row.rawBodyJson === rawBodyJson
+    ? row
+    : null;
+}
+
+function writeCachedNormalizedSnapshotRowGlobal(
+  cache: Map<SnapshotKey, RawNormalizedSnapshotRow>,
+  candidate: SnapshotCandidate,
+  rawBodyJson: string,
+  bodyJson: string,
+): RawNormalizedSnapshotRow {
+  const row: RawNormalizedSnapshotRow = {
+    generatedAt: candidate.generatedAt,
+    updatedAt: candidate.updatedAt,
+    rawBodyJson,
+    bodyJson,
+  };
+  cache.set(candidate.key, row);
+  return row;
+}
+
 function isSameUtcDay(a: number, b: number): boolean {
   return Math.floor(a / 86_400) === Math.floor(b / 86_400);
 }
@@ -259,15 +298,33 @@ function readValidatedSnapshotCandidateFromRefreshRows(opts: {
   rowByKey: ReadonlyMap<SnapshotKey, SnapshotRefreshRow>;
   normalize: (candidate: SnapshotCandidate, bodyJson: string) => string | null;
   cacheByDb: WeakMap<D1Database, Map<SnapshotKey, NormalizedSnapshotRow>>;
+  globalCache: Map<SnapshotKey, RawNormalizedSnapshotRow>;
 }): CandidateReadResult {
-  const cached = readCachedNormalizedSnapshotRow(opts.cacheByDb, opts.db, opts.candidate);
-  if (cached) {
-    return { row: cached, invalid: false };
-  }
-
   const row = opts.rowByKey.get(opts.candidate.key);
   if (!row || row.generated_at !== opts.candidate.generatedAt) {
     return { row: null, invalid: false };
+  }
+
+  const dbCached = readCachedNormalizedSnapshotRow(opts.cacheByDb, opts.db, opts.candidate);
+  if (dbCached) {
+    return { row: dbCached, invalid: false };
+  }
+
+  const globalCached = readCachedNormalizedSnapshotRowGlobal(
+    opts.globalCache,
+    opts.candidate,
+    row.body_json,
+  );
+  if (globalCached) {
+    return {
+      row: writeCachedNormalizedSnapshotRow(
+        opts.cacheByDb,
+        opts.db,
+        opts.candidate,
+        globalCached.bodyJson,
+      ),
+      invalid: false,
+    };
   }
 
   const bodyJson = opts.normalize(opts.candidate, row.body_json);
@@ -275,6 +332,12 @@ function readValidatedSnapshotCandidateFromRefreshRows(opts: {
     return { row: null, invalid: true };
   }
 
+  writeCachedNormalizedSnapshotRowGlobal(
+    opts.globalCache,
+    opts.candidate,
+    row.body_json,
+    bodyJson,
+  );
   return {
     row: writeCachedNormalizedSnapshotRow(opts.cacheByDb, opts.db, opts.candidate, bodyJson),
     invalid: false,
@@ -287,6 +350,7 @@ function readFirstValidCandidateFromRefreshRows(opts: {
   rowByKey: ReadonlyMap<SnapshotKey, SnapshotRefreshRow>;
   normalize: (candidate: SnapshotCandidate, bodyJson: string) => string | null;
   cacheByDb: WeakMap<D1Database, Map<SnapshotKey, NormalizedSnapshotRow>>;
+  globalCache: Map<SnapshotKey, RawNormalizedSnapshotRow>;
 }): { row: NormalizedSnapshotRow | null; invalid: boolean } {
   let invalid = false;
 
@@ -297,6 +361,7 @@ function readFirstValidCandidateFromRefreshRows(opts: {
       rowByKey: opts.rowByKey,
       normalize: opts.normalize,
       cacheByDb: opts.cacheByDb,
+      globalCache: opts.globalCache,
     });
     if (result.invalid) {
       invalid = true;
@@ -325,6 +390,7 @@ export async function readHomepageSnapshotGeneratedAt(db: D1Database): Promise<n
     normalize: (candidate, bodyJson) =>
       normalizeHomepagePayloadBodyJsonForKey(candidate.key, bodyJson),
     cacheByDb: normalizedHomepagePayloadCacheByDb,
+    globalCache: normalizedHomepagePayloadCacheGlobal,
   });
   return row?.generatedAt ?? null;
 }
@@ -345,6 +411,7 @@ export async function readHomepageArtifactSnapshotGeneratedAt(
       rowByKey,
       normalize: (_candidate, bodyJson) => normalizeHomepageArtifactBodyJson(bodyJson),
       cacheByDb: normalizedHomepageArtifactCacheByDb,
+      globalCache: normalizedHomepageArtifactCacheGlobal,
     });
     if (result.row) {
       return result.row.generatedAt;
@@ -377,18 +444,35 @@ export async function readHomepageRefreshBaseSnapshot(
     let invalid = false;
 
     for (const candidate of candidateList) {
-      const cached = readCachedNormalizedSnapshotRow(
+      const row = rowByKey.get(candidate.key);
+      if (!row || row.generated_at !== candidate.generatedAt) {
+        continue;
+      }
+
+      const dbCached = readCachedNormalizedSnapshotRow(
         normalizedHomepagePayloadCacheByDb,
         db,
         candidate,
       );
-      if (cached) {
-        return { row: cached, invalid };
+      if (dbCached) {
+        return { row: dbCached, invalid };
       }
 
-      const row = rowByKey.get(candidate.key);
-      if (!row || row.generated_at !== candidate.generatedAt) {
-        continue;
+      const globalCached = readCachedNormalizedSnapshotRowGlobal(
+        normalizedHomepagePayloadCacheGlobal,
+        candidate,
+        row.body_json,
+      );
+      if (globalCached) {
+        return {
+          row: writeCachedNormalizedSnapshotRow(
+            normalizedHomepagePayloadCacheByDb,
+            db,
+            candidate,
+            globalCached.bodyJson,
+          ),
+          invalid,
+        };
       }
 
       const bodyJson = normalizeHomepagePayloadBodyJsonForKey(candidate.key, row.body_json);
@@ -396,6 +480,13 @@ export async function readHomepageRefreshBaseSnapshot(
         invalid = true;
         continue;
       }
+
+      writeCachedNormalizedSnapshotRowGlobal(
+        normalizedHomepagePayloadCacheGlobal,
+        candidate,
+        row.body_json,
+        bodyJson,
+      );
 
       return {
         row: writeCachedNormalizedSnapshotRow(
@@ -480,6 +571,7 @@ export async function readHomepageSnapshotJsonAnyAge(
       normalize: (currentCandidate, bodyJson) =>
         normalizeHomepagePayloadBodyJsonForKey(currentCandidate.key, bodyJson),
       cacheByDb: normalizedHomepagePayloadCacheByDb,
+      globalCache: normalizedHomepagePayloadCacheGlobal,
     });
     if (!result.row) {
       if (result.invalid) {
@@ -521,6 +613,7 @@ export async function readHomepageSnapshotArtifactJson(
       rowByKey,
       normalize: (_candidate, bodyJson) => normalizeHomepageArtifactBodyJson(bodyJson),
       cacheByDb: normalizedHomepageArtifactCacheByDb,
+      globalCache: normalizedHomepageArtifactCacheGlobal,
     });
     if (!result.row) {
       if (result.invalid) {
@@ -555,6 +648,7 @@ export async function readStaleHomepageSnapshotArtifactJson(
       rowByKey,
       normalize: (_candidate, bodyJson) => normalizeHomepageArtifactBodyJson(bodyJson),
       cacheByDb: normalizedHomepageArtifactCacheByDb,
+      globalCache: normalizedHomepageArtifactCacheGlobal,
     });
     if (!result.row) {
       if (result.invalid) {
