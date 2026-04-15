@@ -21,7 +21,10 @@ import {
   writeHomepageArtifactSnapshot,
   writeHomepageSnapshot,
 } from '../src/snapshots/public-homepage';
-import { readHomepageRefreshBaseSnapshot } from '../src/snapshots/public-homepage-read';
+import {
+  readHomepageRefreshBaseSnapshot,
+  readHomepageSnapshotJsonAnyAge,
+} from '../src/snapshots/public-homepage-read';
 import { createFakeD1Database } from './helpers/fake-d1';
 
 function samplePayload(now = 1_728_000_000) {
@@ -414,20 +417,11 @@ describe('snapshots/public-homepage', () => {
     ]);
   });
 
-  it('prefers the same-day compact homepage row as the internal refresh base snapshot', async () => {
+  it('prefers the freshest valid same-day snapshot as the internal refresh base snapshot', async () => {
     const now = 1_728_000_500;
     const payload = samplePayload(now - 300);
     const artifactPayload = samplePayload(now - 60);
     const db = createFakeD1Database([
-      {
-        match: 'select generated_at from public_snapshots',
-        first: (args) => {
-          if (args[0] === 'homepage:artifact') {
-            return { generated_at: artifactPayload.generated_at };
-          }
-          return null;
-        },
-      },
       {
         match: 'select generated_at, body_json from public_snapshots',
         first: (args) => {
@@ -450,8 +444,31 @@ describe('snapshots/public-homepage', () => {
 
     await expect(readHomepageRefreshBaseSnapshot(db, now)).resolves.toEqual({
       generatedAt: artifactPayload.generated_at,
-      bodyJson: JSON.stringify(payload),
+      bodyJson: JSON.stringify(artifactPayload),
       seedDataSnapshot: false,
+    });
+  });
+
+  it('normalizes artifact rows to the homepage payload shape on the public read path', async () => {
+    const now = 1_728_000_200;
+    const payload = samplePayload(now - 10);
+    const render = buildHomepageRenderArtifact(payload);
+    const db = createFakeD1Database([
+      {
+        match: 'select generated_at, body_json from public_snapshots',
+        first: (args) =>
+          args[0] === 'homepage:artifact'
+            ? {
+                generated_at: payload.generated_at,
+                body_json: JSON.stringify(render),
+              }
+            : null,
+      },
+    ]);
+
+    await expect(readHomepageSnapshotJsonAnyAge(db, now)).resolves.toEqual({
+      bodyJson: JSON.stringify(payload),
+      age: 10,
     });
   });
 

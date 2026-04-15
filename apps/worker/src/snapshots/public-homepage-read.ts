@@ -20,6 +20,16 @@ const READ_SNAPSHOT_GENERATED_AT_SQL = `
 const readSnapshotStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const readSnapshotGeneratedAtStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 
+type SnapshotRow = {
+  generated_at: number;
+  body_json: string;
+};
+
+type NormalizedSnapshotPayloadRow = {
+  generatedAt: number;
+  bodyJson: string;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
@@ -65,7 +75,10 @@ function looksLikeSerializedHomepagePayload(text: string): boolean {
   return (
     trimmed.startsWith('{"generated_at":') &&
     trimmed.includes('"bootstrap_mode"') &&
-    trimmed.includes('"monitor_count_total"')
+    trimmed.includes('"monitor_count_total"') &&
+    !trimmed.includes('"preload_html":') &&
+    !trimmed.includes('"meta_title":') &&
+    !trimmed.includes('"meta_description":')
   );
 }
 
@@ -120,7 +133,7 @@ function isSameUtcDay(a: number, b: number): boolean {
 async function readSnapshotRow(
   db: D1Database,
   key: string,
-): Promise<{ generated_at: number; body_json: string } | null> {
+): Promise<SnapshotRow | null> {
   try {
     const cached = readSnapshotStatementByDb.get(db);
     const statement = cached ?? db.prepare(READ_SNAPSHOT_SQL);
@@ -128,7 +141,7 @@ async function readSnapshotRow(
       readSnapshotStatementByDb.set(db, statement);
     }
 
-    return await statement.bind(key).first<{ generated_at: number; body_json: string }>();
+    return await statement.bind(key).first<SnapshotRow>();
   } catch (err) {
     console.warn('homepage snapshot: read failed', err);
     return null;
@@ -167,6 +180,39 @@ export async function readHomepageArtifactSnapshotGeneratedAt(
   );
 }
 
+function normalizeSnapshotPayloadRow(row: SnapshotRow | null): NormalizedSnapshotPayloadRow | null {
+  if (!row) return null;
+
+  const bodyJson = normalizeHomepagePayloadBodyJson(row.body_json);
+  if (!bodyJson) {
+    return null;
+  }
+
+  return {
+    generatedAt: row.generated_at,
+    bodyJson,
+  };
+}
+
+function pickFreshestSnapshotRow(
+  rows: readonly NormalizedSnapshotPayloadRow[],
+): NormalizedSnapshotPayloadRow | null {
+  if (rows.length === 0) {
+    return null;
+  }
+
+  let freshest = rows[0] ?? null;
+  for (let index = 1; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (!row) continue;
+    if (!freshest || row.generatedAt > freshest.generatedAt) {
+      freshest = row;
+    }
+  }
+
+  return freshest;
+}
+
 export async function readHomepageRefreshBaseSnapshot(
   db: D1Database,
   now: number,
@@ -175,52 +221,46 @@ export async function readHomepageRefreshBaseSnapshot(
   bodyJson: string | null;
   seedDataSnapshot: boolean;
 }> {
-  const [artifactGeneratedAt, homepageRow] = await Promise.all([
-    readSnapshotGeneratedAt(db, SNAPSHOT_ARTIFACT_KEY),
+  const [artifactRow, homepageRow] = await Promise.all([
+    readSnapshotRow(db, SNAPSHOT_ARTIFACT_KEY),
     readSnapshotRow(db, SNAPSHOT_KEY),
   ]);
-  const generatedAt = Math.max(
-    artifactGeneratedAt ?? Number.NEGATIVE_INFINITY,
-    homepageRow?.generated_at ?? Number.NEGATIVE_INFINITY,
+
+  const normalizedRows = [normalizeSnapshotPayloadRow(artifactRow), normalizeSnapshotPayloadRow(homepageRow)]
+    .filter((row): row is NormalizedSnapshotPayloadRow => row !== null);
+  const sameDayBase = pickFreshestSnapshotRow(
+    normalizedRows.filter((row) => isSameUtcDay(row.generatedAt, now)),
   );
-
-  if (
-    homepageRow &&
-    isSameUtcDay(homepageRow.generated_at, now)
-  ) {
-    const bodyJson = normalizeHomepagePayloadBodyJson(homepageRow.body_json);
-    if (bodyJson) {
-      return {
-        generatedAt: Number.isFinite(generatedAt) ? generatedAt : homepageRow.generated_at,
-        bodyJson,
-        seedDataSnapshot: false,
-      };
-    }
+  if (sameDayBase) {
+    return {
+      generatedAt: sameDayBase.generatedAt,
+      bodyJson: sameDayBase.bodyJson,
+      seedDataSnapshot: false,
+    };
   }
 
-  const artifactRow = await readSnapshotRow(db, SNAPSHOT_ARTIFACT_KEY);
-  const preferredBodyJson = artifactRow?.body_json ?? homepageRow?.body_json ?? null;
-  if (!preferredBodyJson) {
+  const freshestBase = pickFreshestSnapshotRow(normalizedRows);
+  if (freshestBase) {
     return {
-      generatedAt: Number.isFinite(generatedAt) ? generatedAt : null,
+      generatedAt: freshestBase.generatedAt,
+      bodyJson: freshestBase.bodyJson,
+      seedDataSnapshot: true,
+    };
+  }
+
+  if (!artifactRow && !homepageRow) {
+    return {
+      generatedAt: null,
       bodyJson: null,
       seedDataSnapshot: true,
     };
   }
 
-  const bodyJson = normalizeHomepagePayloadBodyJson(preferredBodyJson);
-  if (!bodyJson) {
-    console.warn('homepage snapshot: invalid refresh payload');
-    return {
-      generatedAt: Number.isFinite(generatedAt) ? generatedAt : null,
-      bodyJson: null,
-      seedDataSnapshot: true,
-    };
-  }
+  console.warn('homepage snapshot: invalid refresh payload');
 
   return {
-    generatedAt: Number.isFinite(generatedAt) ? generatedAt : null,
-    bodyJson,
+    generatedAt: null,
+    bodyJson: null,
     seedDataSnapshot: true,
   };
 }
@@ -247,19 +287,6 @@ export async function readHomepageSnapshotJsonAnyAge(
 
   const age = Math.max(0, now - row.generated_at);
   if (age > maxStaleSeconds) return null;
-
-  if (looksLikeSerializedHomepageArtifact(row.body_json)) {
-    const bodyJson = normalizeHomepagePayloadBodyJson(row.body_json);
-    if (!bodyJson) {
-      console.warn('homepage snapshot: invalid payload');
-      return null;
-    }
-    return { bodyJson, age };
-  }
-
-  if (looksLikeSerializedHomepagePayload(row.body_json)) {
-    return { bodyJson: row.body_json, age };
-  }
 
   const bodyJson = normalizeHomepagePayloadBodyJson(row.body_json);
   if (!bodyJson) {

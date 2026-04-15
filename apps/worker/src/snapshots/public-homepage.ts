@@ -416,7 +416,10 @@ function looksLikeSerializedHomepagePayload(text: string): boolean {
   return (
     trimmed.startsWith('{"generated_at":') &&
     trimmed.includes('"bootstrap_mode"') &&
-    trimmed.includes('"monitor_count_total"')
+    trimmed.includes('"monitor_count_total"') &&
+    !trimmed.includes('"preload_html":') &&
+    !trimmed.includes('"meta_title":') &&
+    !trimmed.includes('"meta_description":')
   );
 }
 

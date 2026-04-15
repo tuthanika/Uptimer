@@ -278,6 +278,34 @@ describe('public homepage route', () => {
     expect(res.headers.get('Vary')).toContain('Origin');
   });
 
+  it('reads homepage payloads from artifact snapshots on the direct public route', async () => {
+    const payload = samplePayload(190);
+    const render = {
+      generated_at: payload.generated_at,
+      preload_html: '<div id="uptimer-preload">hello</div>',
+      snapshot: payload,
+      meta_title: 'Uptimer',
+      meta_description: 'All Systems Operational',
+    };
+    vi.spyOn(Date, 'now').mockReturnValue(200_000);
+
+    const res = await requestHomepage([
+      {
+        match: 'from public_snapshots',
+        first: (args) =>
+          args[0] === 'homepage:artifact'
+            ? {
+                generated_at: payload.generated_at,
+                body_json: JSON.stringify(render),
+              }
+            : null,
+      },
+    ]);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(payload);
+  });
+
   it('skips shared edge cache for homepage responses even when app-level CORS reflection is enabled', async () => {
     const payload = samplePayload(190);
     const dbReads: string[] = [];
@@ -351,6 +379,34 @@ describe('public homepage route', () => {
     expect(await res.json()).toEqual(payload);
     expect(dbReads).toEqual(['homepage:artifact', 'homepage']);
     expect(res.headers.get('Cache-Control')).toContain('max-age=0');
+  });
+
+  it('normalizes artifact snapshots to homepage payloads via the worker hot path', async () => {
+    const payload = samplePayload(190);
+    const render = {
+      generated_at: payload.generated_at,
+      preload_html: '<div id="uptimer-preload">hello</div>',
+      snapshot: payload,
+      meta_title: 'Uptimer',
+      meta_description: 'All Systems Operational',
+    };
+    vi.spyOn(Date, 'now').mockReturnValue(200_000);
+
+    const res = await requestHomepageViaApp('/api/v1/public/homepage', [
+      {
+        match: 'from public_snapshots',
+        first: (args) =>
+          args[0] === 'homepage:artifact'
+            ? {
+                generated_at: payload.generated_at,
+                body_json: JSON.stringify(render),
+              }
+            : null,
+      },
+    ]);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(payload);
   });
 
   it('falls back to the fresh public status snapshot when the full homepage snapshot is missing', async () => {
