@@ -120,14 +120,30 @@ function heartbeatHeightPct(
   return 36 + Math.min(64, Math.max(0, latencyMs / 12));
 }
 
-function buildStripSvgFromPathGroups(
-  pathByFill: ReadonlyMap<string, string[]>,
-  width: number,
-  height: number,
-): string {
+type StripRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  fill: string;
+};
+
+function buildStripSvgFromRects(rects: StripRect[], width: number, height: number): string {
+  const pathByFill = new Map<string, string[]>();
+
+  for (const rect of rects) {
+    if (rect.width <= 0 || rect.height <= 0) continue;
+    const command = `M${rect.x},${rect.y}h${rect.width}v${rect.height}H${rect.x}z`;
+    const existing = pathByFill.get(rect.fill);
+    if (existing) {
+      existing.push(command);
+      continue;
+    }
+    pathByFill.set(rect.fill, [command]);
+  }
+
   const paths: string[] = [];
   for (const [fill, commands] of pathByFill.entries()) {
-    if (commands.length === 0) continue;
     paths.push(`<path d="${commands.join('')}" fill="${fill}"/>`);
   }
 
@@ -147,18 +163,17 @@ function buildUptimeStripSvg(
   const gap = 2;
   const height = 20;
   const width = count <= 0 ? barWidth : count * barWidth + Math.max(0, count - 1) * gap;
-  const pathByFill = new Map<string, string[]>();
+  const rects: StripRect[] = [];
   for (let index = 0; index < count; index += 1) {
-    const fill = uptimeFillFromMilli(strip.uptime_pct_milli[index]);
-    const existing = pathByFill.get(fill);
-    const command = `M${index * (barWidth + gap)},0h${barWidth}v${height}H${index * (barWidth + gap)}z`;
-    if (existing) {
-      existing.push(command);
-    } else {
-      pathByFill.set(fill, [command]);
-    }
+    rects.push({
+      x: index * (barWidth + gap),
+      y: 0,
+      width: barWidth,
+      height,
+      fill: uptimeFillFromMilli(strip.uptime_pct_milli[index]),
+    });
   }
-  return buildStripSvgFromPathGroups(pathByFill, width, height);
+  return buildStripSvgFromRects(rects, width, height);
 }
 
 function buildHeartbeatStripSvg(
@@ -173,24 +188,20 @@ function buildHeartbeatStripSvg(
   const gap = 2;
   const height = 20;
   const width = count <= 0 ? barWidth : count * barWidth + Math.max(0, count - 1) * gap;
-  const pathByFill = new Map<string, string[]>();
+  const rects: StripRect[] = [];
   for (let index = 0; index < count; index += 1) {
     const barHeight = Math.round(
       (height * heartbeatHeightPct(strip.status_codes[index], strip.latency_ms[index])) / 100,
     );
-    if (barHeight <= 0) continue;
-    const x = index * (barWidth + gap);
-    const y = height - barHeight;
-    const fill = heartbeatFillFromCode(strip.status_codes[index]);
-    const existing = pathByFill.get(fill);
-    const command = `M${x},${y}h${barWidth}v${barHeight}H${x}z`;
-    if (existing) {
-      existing.push(command);
-    } else {
-      pathByFill.set(fill, [command]);
-    }
+    rects.push({
+      x: index * (barWidth + gap),
+      y: height - barHeight,
+      width: barWidth,
+      height: barHeight,
+      fill: heartbeatFillFromCode(strip.status_codes[index]),
+    });
   }
-  return buildStripSvgFromPathGroups(pathByFill, width, height);
+  return buildStripSvgFromRects(rects, width, height);
 }
 
 function renderIncidentCard(
@@ -255,36 +266,35 @@ function renderPreload(
   const monitorNames: ReadonlyMap<number, string> | null = needsMonitorNames
     ? monitorNameById ?? new Map(snapshot.monitors.map((monitor) => [monitor.id, monitor.name]))
     : null;
-  const groups = new Map<string, { count: number; cards: string[] }>();
+  const groups = new Map<string, PublicHomepageResponse['monitors']>();
   for (const monitor of snapshot.monitors) {
     const key = monitorGroupLabel(monitor.group_name);
-    const existing = groups.get(key);
-    const group = existing ?? { count: 0, cards: [] };
-    group.count += 1;
-
-    const uptimePct =
-      typeof monitor.uptime_30d?.uptime_pct === 'number'
-        ? `${monitor.uptime_30d.uptime_pct.toFixed(3)}%`
-        : '-';
-    const status = monitor.status;
-    const statusLabel = escapeHtml(status);
-    const lastCheckedLabel = monitor.last_checked_at
-      ? `Last checked: ${formatTimestamp(monitor.last_checked_at)}`
-      : 'Never checked';
-
-    group.cards.push(
-      `<article class="card"><div class="row"><div class="lhs"><span class="dot dot-${status}"></span><div class="ut"><div class="mn">${escapeHtml(monitor.name)}</div><div class="mt">${escapeHtml(monitor.type)}</div></div></div><div class="rhs"><span class="up">${escapeHtml(uptimePct)}</span><span class="sb sb-${status}">${statusLabel}</span></div></div><div><div class="lbl">Availability (30d)</div><div class="strip">${buildUptimeStripSvg(monitor.uptime_day_strip)}</div></div><div><div class="lbl">Recent checks</div><div class="strip">${buildHeartbeatStripSvg(monitor.heartbeat_strip)}</div></div><div class="ft">${lastCheckedLabel}</div></article>`,
-    );
-
-    if (!existing) {
-      groups.set(key, group);
-    }
+    const existing = groups.get(key) ?? [];
+    existing.push(monitor);
+    groups.set(key, existing);
   }
 
   const groupedMonitorsParts: string[] = [];
-  for (const [groupName, group] of groups.entries()) {
+  for (const [groupName, groupMonitors] of groups.entries()) {
+    const monitorCardsParts: string[] = [];
+    for (const monitor of groupMonitors) {
+      const uptimePct =
+        typeof monitor.uptime_30d?.uptime_pct === 'number'
+          ? `${monitor.uptime_30d.uptime_pct.toFixed(3)}%`
+          : '-';
+      const status = monitor.status;
+      const statusLabel = escapeHtml(status);
+      const lastCheckedLabel = monitor.last_checked_at
+        ? `Last checked: ${formatTimestamp(monitor.last_checked_at)}`
+        : 'Never checked';
+
+      monitorCardsParts.push(
+        `<article class="card"><div class="row"><div class="lhs"><span class="dot dot-${status}"></span><div class="ut"><div class="mn">${escapeHtml(monitor.name)}</div><div class="mt">${escapeHtml(monitor.type)}</div></div></div><div class="rhs"><span class="up">${escapeHtml(uptimePct)}</span><span class="sb sb-${status}">${statusLabel}</span></div></div><div><div class="lbl">Availability (30d)</div><div class="strip">${buildUptimeStripSvg(monitor.uptime_day_strip)}</div></div><div><div class="lbl">Recent checks</div><div class="strip">${buildHeartbeatStripSvg(monitor.heartbeat_strip)}</div></div><div class="ft">${lastCheckedLabel}</div></article>`,
+      );
+    }
+
     groupedMonitorsParts.push(
-      `<section class="sg"><div class="sgh"><h4 class="sgt">${escapeHtml(groupName)}</h4><span class="sgc">${group.count}</span></div><div class="grid">${group.cards.join('')}</div></section>`,
+      `<section class="sg"><div class="sgh"><h4 class="sgt">${escapeHtml(groupName)}</h4><span class="sgc">${groupMonitors.length}</span></div><div class="grid">${monitorCardsParts.join('')}</div></section>`,
     );
   }
 
@@ -343,12 +353,9 @@ export function buildHomepageRenderArtifact(
     fullSnapshot.maintenance_windows.active.length > 0 ||
     fullSnapshot.maintenance_windows.upcoming.length > 0 ||
     fullSnapshot.maintenance_history_preview !== null;
-  const allMonitorNames = needsMonitorNames ? new Map<number, string>() : undefined;
-  if (allMonitorNames) {
-    for (const monitor of fullSnapshot.monitors) {
-      allMonitorNames.set(monitor.id, monitor.name);
-    }
-  }
+  const allMonitorNames = needsMonitorNames
+    ? new Map(fullSnapshot.monitors.map((monitor) => [monitor.id, monitor.name]))
+    : undefined;
   const metaTitle = normalizeSnapshotText(fullSnapshot.site_title, 'Uptimer');
   const fallbackDescription = normalizeSnapshotText(
     fullSnapshot.banner.title,
