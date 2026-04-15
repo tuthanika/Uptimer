@@ -167,7 +167,6 @@ publicRoutes.use(
     // public snapshot freshness), so skipping the shared edge cache reduces
     // median CPU without changing the user-visible payload.
     skipPathnames: [
-      '/api/v1/public/status',
       '/api/v1/public/homepage',
       '/api/v1/public/homepage-artifact',
     ],
