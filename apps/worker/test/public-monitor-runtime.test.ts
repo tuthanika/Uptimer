@@ -18,6 +18,7 @@ describe('public/monitor-runtime', () => {
       monitors: [
         {
           monitor_id: 1,
+          created_at: 0,
           interval_sec: 60,
           range_start_at: 0,
           materialized_at: 60,
@@ -67,6 +68,7 @@ describe('public/monitor-runtime', () => {
     const totals = materializeMonitorRuntimeTotals(
       {
         monitor_id: 1,
+        created_at: 0,
         interval_sec: 60,
         range_start_at: 0,
         materialized_at: 120,
@@ -94,6 +96,7 @@ describe('public/monitor-runtime', () => {
   it('decodes runtime heartbeat strips back into public heartbeat rows', () => {
     const heartbeats = runtimeEntryToHeartbeats({
       monitor_id: 1,
+      created_at: 0,
       interval_sec: 60,
       range_start_at: 0,
       materialized_at: 120,
@@ -129,6 +132,7 @@ describe('public/monitor-runtime', () => {
             monitors: [
               {
                 monitor_id: 1,
+                created_at: null,
                 interval_sec: 60,
                 range_start_at: 0,
                 materialized_at: 120,
@@ -150,6 +154,7 @@ describe('public/monitor-runtime', () => {
     ]);
 
     const snapshot = await readPublicMonitorRuntimeSnapshot(db, 120);
+    expect(snapshot?.monitors[0]?.created_at).toBeNull();
     expect(snapshot?.monitors[0]?.heartbeat_gap_sec).toBe('1o,1o');
     expect(snapshot?.monitors[0] && runtimeEntryToHeartbeats(snapshot.monitors[0])).toEqual([
       { checked_at: 120, latency_ms: 40, status: 'up' },

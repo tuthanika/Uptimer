@@ -5,11 +5,14 @@ import {
 import type { PublicStatusResponse } from '../schemas/public-status';
 import type { Trace } from '../observability/trace';
 import {
+  fromRuntimeStatusCode,
   materializeMonitorRuntimeTotals,
   readPublicMonitorRuntimeSnapshot,
   runtimeEntryToHeartbeats,
   snapshotHasMonitorIds,
   toMonitorRuntimeEntryMap,
+  type PublicMonitorRuntimeEntry,
+  type PublicMonitorRuntimeSnapshot,
 } from './monitor-runtime';
 
 import {
@@ -74,6 +77,11 @@ type HomepageUptimeDayStripAggRawRow = [
   total_sec_sum: number | null,
   uptime_sec_sum: number | null,
 ];
+
+type HomepageMonitorMetadataStamp = {
+  monitorCountTotal: number;
+  maxUpdatedAt: number | null;
+};
 
 type HomepageMonitorDataOptions = {
   cardLimit?: number;
@@ -394,6 +402,72 @@ function reuseHistoricalRollupsFromBase(opts: {
   opts.monitor.uptime_day_strip.uptime_pct_milli = uptimePctMilli;
 }
 
+function hasReusableRuntimeCreatedAt(
+  entry: PublicMonitorRuntimeEntry | undefined,
+): entry is PublicMonitorRuntimeEntry & { created_at: number } {
+  return typeof entry?.created_at === 'number' && Number.isInteger(entry.created_at);
+}
+
+function canReuseBaseSnapshotMonitorMetadata(opts: {
+  baseSnapshot: PublicHomepageResponse | null | undefined;
+  metadataStamp: HomepageMonitorMetadataStamp | null;
+  runtimeSnapshot: PublicMonitorRuntimeSnapshot | null;
+}): boolean {
+  const { baseSnapshot, metadataStamp, runtimeSnapshot } = opts;
+  if (!baseSnapshot || !metadataStamp || !runtimeSnapshot) {
+    return false;
+  }
+
+  if (
+    metadataStamp.monitorCountTotal !== baseSnapshot.monitor_count_total ||
+    baseSnapshot.monitors.length !== metadataStamp.monitorCountTotal
+  ) {
+    return false;
+  }
+
+  if ((metadataStamp.maxUpdatedAt ?? 0) > baseSnapshot.generated_at) {
+    return false;
+  }
+
+  const monitorIds = baseSnapshot.monitors.map((monitor) => monitor.id);
+  if (
+    runtimeSnapshot.monitors.length !== metadataStamp.monitorCountTotal ||
+    !snapshotHasMonitorIds(runtimeSnapshot, monitorIds)
+  ) {
+    return false;
+  }
+
+  const runtimeById = toMonitorRuntimeEntryMap(runtimeSnapshot);
+  return baseSnapshot.monitors.every((monitor) => hasReusableRuntimeCreatedAt(runtimeById.get(monitor.id)));
+}
+
+function buildHomepageMonitorRowsFromBaseSnapshot(
+  baseSnapshot: PublicHomepageResponse,
+  runtimeSnapshot: PublicMonitorRuntimeSnapshot,
+): HomepageMonitorRow[] {
+  const runtimeById = toMonitorRuntimeEntryMap(runtimeSnapshot);
+
+  return baseSnapshot.monitors.flatMap((monitor) => {
+    const runtimeEntry = runtimeById.get(monitor.id);
+    if (!hasReusableRuntimeCreatedAt(runtimeEntry)) {
+      return [];
+    }
+
+    return [
+      {
+        id: monitor.id,
+        name: monitor.name,
+        type: monitor.type,
+        group_name: monitor.group_name,
+        interval_sec: runtimeEntry.interval_sec,
+        created_at: runtimeEntry.created_at,
+        state_status: fromRuntimeStatusCode(runtimeEntry.last_status_code),
+        last_checked_at: runtimeEntry.last_checked_at,
+      },
+    ];
+  });
+}
+
 async function listHomepageMonitorRows(
   db: D1Database,
   includeHiddenMonitors: boolean,
@@ -434,6 +508,32 @@ async function listHomepageMonitorRows(
       : await stmt.bind(limit).all<HomepageMonitorRow>();
 
   return result.results ?? [];
+}
+
+async function readHomepageMonitorMetadataStamp(
+  db: D1Database,
+  includeHiddenMonitors: boolean,
+): Promise<HomepageMonitorMetadataStamp> {
+  const row = await db
+    .prepare(
+      `
+      SELECT
+        COUNT(*) AS monitor_count_total,
+        MAX(COALESCE(m.updated_at, m.created_at, 0)) AS max_updated_at
+      FROM monitors m
+      WHERE m.is_active = 1
+        AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
+    `,
+    )
+    .first<{
+      monitor_count_total: number | null;
+      max_updated_at: number | null;
+    }>();
+
+  return {
+    monitorCountTotal: row?.monitor_count_total ?? 0,
+    maxUpdatedAt: row?.max_updated_at ?? null,
+  };
 }
 
 async function readHomepageMonitorSummary(
@@ -558,6 +658,7 @@ async function buildHomepageMonitorCardsFromRows(
   rows: HomepageMonitorRow[],
   maintenanceMonitorIds: ReadonlySet<number>,
   baseSnapshot: PublicHomepageResponse | null | undefined,
+  runtimeSnapshot: PublicMonitorRuntimeSnapshot | null | undefined,
   trace?: Trace,
 ): Promise<HomepageMonitorCard[]> {
   if (rows.length === 0) {
@@ -583,14 +684,17 @@ async function buildHomepageMonitorCardsFromRows(
   const baseMonitorsById = baseSnapshot
     ? new Map(baseSnapshot.monitors.map((monitor) => [monitor.id, monitor]))
     : null;
-  const runtimeSnapshot = await withTraceAsync(
-    trace,
-    'homepage_cards_runtime_cache_read',
-    async () => await readPublicMonitorRuntimeSnapshot(db, now),
-  );
+  const resolvedRuntimeSnapshot =
+    runtimeSnapshot !== undefined
+      ? runtimeSnapshot
+      : await withTraceAsync(
+          trace,
+          'homepage_cards_runtime_cache_read',
+          async () => await readPublicMonitorRuntimeSnapshot(db, now),
+        );
   const runtimeById =
-    runtimeSnapshot && snapshotHasMonitorIds(runtimeSnapshot, selectedIds)
-      ? toMonitorRuntimeEntryMap(runtimeSnapshot)
+    resolvedRuntimeSnapshot && snapshotHasMonitorIds(resolvedRuntimeSnapshot, selectedIds)
+      ? toMonitorRuntimeEntryMap(resolvedRuntimeSnapshot)
       : null;
   const monitorIndexById = new Map<number, number>();
   for (let index = 0; index < monitors.length; index += 1) {
@@ -814,12 +918,49 @@ async function buildHomepageMonitorData(
   uptimeRatingLevel: 1 | 2 | 3 | 4 | 5;
 }> {
   const trace = opts.trace;
-  const rawMonitors = await withTraceAsync(
-    trace,
-    'homepage_monitor_rows',
-    async () => await listHomepageMonitorRows(db, includeHiddenMonitors),
-  );
-  const monitorCountTotal = rawMonitors.length;
+  const baseSnapshot = opts.baseSnapshot ?? null;
+  const runtimeSnapshotPromise =
+    baseSnapshot === null
+      ? Promise.resolve<PublicMonitorRuntimeSnapshot | null | undefined>(undefined)
+      : withTraceAsync(
+          trace,
+          'homepage_cards_runtime_cache_read',
+          async () => await readPublicMonitorRuntimeSnapshot(db, now),
+        );
+  const monitorMetadataStampPromise =
+    baseSnapshot === null
+      ? Promise.resolve<HomepageMonitorMetadataStamp | null>(null)
+      : withTraceAsync(
+          trace,
+          'homepage_monitor_metadata_stamp',
+          async () => await readHomepageMonitorMetadataStamp(db, includeHiddenMonitors),
+        );
+  const [runtimeSnapshot, monitorMetadataStamp] = await Promise.all([
+    runtimeSnapshotPromise,
+    monitorMetadataStampPromise,
+  ]);
+
+  const reuseBaseMonitorRows = canReuseBaseSnapshotMonitorMetadata({
+    baseSnapshot,
+    metadataStamp: monitorMetadataStamp,
+    runtimeSnapshot: runtimeSnapshot ?? null,
+  });
+  const rawMonitors =
+    reuseBaseMonitorRows &&
+    baseSnapshot !== null &&
+    runtimeSnapshot !== undefined &&
+    runtimeSnapshot !== null
+    ? withTraceSync(trace, 'homepage_monitor_rows_reuse', () =>
+        buildHomepageMonitorRowsFromBaseSnapshot(baseSnapshot, runtimeSnapshot),
+      )
+    : await withTraceAsync(
+        trace,
+        'homepage_monitor_rows',
+        async () => await listHomepageMonitorRows(db, includeHiddenMonitors),
+      );
+  const monitorCountTotal = reuseBaseMonitorRows
+    ? monitorMetadataStamp?.monitorCountTotal ?? rawMonitors.length
+    : rawMonitors.length;
   const ids = rawMonitors.map((monitor) => monitor.id);
   const selectedRows =
     opts.cardLimit === undefined ? rawMonitors : rawMonitors.slice(0, Math.max(0, opts.cardLimit));
@@ -886,6 +1027,7 @@ async function buildHomepageMonitorData(
         selectedRows,
         maintenanceMonitorIds,
         opts.baseSnapshot,
+        runtimeSnapshot,
         trace,
       ),
   );
@@ -1290,6 +1432,7 @@ export async function computePublicHomepageArtifactPayload(
     now,
     bootstrapRows,
     maintenanceMonitorIds,
+    undefined,
     undefined,
   );
 

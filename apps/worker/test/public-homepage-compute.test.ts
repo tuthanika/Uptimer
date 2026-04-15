@@ -198,7 +198,7 @@ describe('computePublicHomepagePayload', () => {
     });
   });
 
-  it('reuses historical uptime strips from the base snapshot without querying rollups', async () => {
+  it('reuses base snapshot monitor metadata and historical uptime strips without querying monitor rows', async () => {
     const now = 1_728_000_000;
     const previousDay = now - 86_400;
 
@@ -258,39 +258,41 @@ describe('computePublicHomepagePayload', () => {
 
     const handlers: FakeD1QueryHandler[] = [
       {
-        match: 'from monitors m',
-        all: () => [
-          {
-            id: 1,
-            name: 'API',
-            type: 'http',
-            group_name: 'Core',
-            group_sort_order: 0,
-            sort_order: 0,
-            interval_sec: 60,
-            created_at: now - 40 * 86_400,
-            state_status: 'up',
-            last_checked_at: previousDay + 60,
-          },
-        ],
+        match: 'count(*) as monitor_count_total',
+        first: () => ({
+          monitor_count_total: 1,
+          max_updated_at: now - 60,
+        }),
       },
       {
-        match: 'select distinct mwm.monitor_id',
-        all: () => [],
-      },
-      {
-        match: 'select checked_at, latency_ms, status from check_results',
-        all: () => [{ checked_at: previousDay + 60, latency_ms: 42, status: 'up' }],
-      },
-      {
-        match: (sql) => sql.startsWith('select key, value from settings'),
-        all: () => [
-          { key: 'site_title', value: 'Status Hub' },
-          { key: 'site_description', value: 'Production services' },
-          { key: 'site_locale', value: 'en' },
-          { key: 'site_timezone', value: 'UTC' },
-          { key: 'uptime_rating_level', value: '4' },
-        ],
+        match: 'from public_snapshots',
+        first: () => ({
+          generated_at: now - 30,
+          body_json: JSON.stringify({
+            version: 1,
+            generated_at: now - 30,
+            day_start_at: now,
+            monitors: [
+              {
+                monitor_id: 1,
+                created_at: now - 40 * 86_400,
+                interval_sec: 60,
+                range_start_at: now,
+                materialized_at: now - 30,
+                last_checked_at: now - 30,
+                last_status_code: 'u',
+                last_outage_open: false,
+                total_sec: 0,
+                downtime_sec: 0,
+                unknown_sec: 0,
+                uptime_sec: 0,
+                heartbeat_gap_sec: '',
+                heartbeat_latency_ms: [42],
+                heartbeat_status_codes: 'u',
+              },
+            ],
+          }),
+        }),
       },
     ];
 
@@ -298,6 +300,13 @@ describe('computePublicHomepagePayload', () => {
       baseSnapshotBodyJson: JSON.stringify(baseSnapshot),
     });
 
+    expect(payload.summary).toEqual({
+      up: 1,
+      down: 0,
+      maintenance: 0,
+      paused: 0,
+      unknown: 0,
+    });
     expect(payload.monitors[0]?.uptime_day_strip).toEqual(baseSnapshot.monitors[0]?.uptime_day_strip);
     expect(payload.monitors[0]?.uptime_30d).toEqual({ uptime_pct: 100 });
   });

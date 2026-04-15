@@ -23,6 +23,7 @@ export type MonitorRuntimeStatusCode = 'u' | 'd' | 'm' | 'x';
 
 export type PublicMonitorRuntimeEntry = {
   monitor_id: number;
+  created_at: number | null;
   interval_sec: number;
   range_start_at: number | null;
   materialized_at: number;
@@ -143,6 +144,7 @@ const runtimeEntrySchema = z
     };
   }, z.object({
     monitor_id: z.number().int().positive(),
+    created_at: z.number().int().nonnegative().nullable().optional().default(null),
     interval_sec: z.number().int().positive(),
     range_start_at: z.number().int().nonnegative().nullable(),
     materialized_at: z.number().int().nonnegative(),
@@ -443,6 +445,7 @@ function createRuntimeEntryForUpdate(
 
   return {
     monitor_id: update.monitor_id,
+    created_at: clampNonNegativeInteger(update.created_at),
     interval_sec: Math.max(1, clampNonNegativeInteger(update.interval_sec)),
     range_start_at: createdToday ? update.checked_at : dayStart,
     materialized_at: update.checked_at,
@@ -480,6 +483,9 @@ export function applyMonitorRuntimeUpdates(
       continue;
     }
 
+    if (existing.created_at === null) {
+      existing.created_at = clampNonNegativeInteger(update.created_at);
+    }
     existing.interval_sec = Math.max(1, clampNonNegativeInteger(update.interval_sec));
     const rangeStartAt = existing.range_start_at;
     const segmentStart =

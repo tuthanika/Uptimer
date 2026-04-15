@@ -92,6 +92,7 @@ export async function rebuildPublicMonitorRuntimeSnapshot(
 
       return {
         monitor_id: row.id,
+        created_at: row.created_at,
         interval_sec: row.interval_sec,
         range_start_at,
         materialized_at: now,
