@@ -29,12 +29,24 @@ const UPSERT_SNAPSHOT_SQL = `
     updated_at = excluded.updated_at
   WHERE excluded.generated_at >= public_snapshots.generated_at
 `;
+const UPSERT_SNAPSHOT_ROWS_SQL = `
+  INSERT INTO public_snapshots (key, generated_at, body_json, updated_at)
+  VALUES
+    (?1, ?2, ?3, ?4),
+    (?5, ?6, ?7, ?8)
+  ON CONFLICT(key) DO UPDATE SET
+    generated_at = excluded.generated_at,
+    body_json = excluded.body_json,
+    updated_at = excluded.updated_at
+  WHERE excluded.generated_at >= public_snapshots.generated_at
+`;
 
 const SPLIT_SNAPSHOT_VERSION = 3;
 const LEGACY_COMBINED_SNAPSHOT_VERSION = 2;
 
 const readSnapshotStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const upsertSnapshotStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+const upsertSnapshotRowsStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 
 function withTraceSync<T>(trace: Trace | undefined, name: string, fn: () => T): T {
   return trace ? trace.time(name, fn) : fn();
@@ -778,6 +790,39 @@ function homepageSnapshotUpsertStatement(
   return statement.bind(key, generatedAt, bodyJson, now);
 }
 
+function homepageSnapshotRowsUpsertStatement(
+  db: D1Database,
+  payload: {
+    key: string;
+    generatedAt: number;
+    bodyJson: string;
+    updatedAt: number;
+  },
+  artifact: {
+    key: string;
+    generatedAt: number;
+    bodyJson: string;
+    updatedAt: number;
+  },
+): D1PreparedStatement {
+  const cached = upsertSnapshotRowsStatementByDb.get(db);
+  const statement = cached ?? db.prepare(UPSERT_SNAPSHOT_ROWS_SQL);
+  if (!cached) {
+    upsertSnapshotRowsStatementByDb.set(db, statement);
+  }
+
+  return statement.bind(
+    payload.key,
+    payload.generatedAt,
+    payload.bodyJson,
+    payload.updatedAt,
+    artifact.key,
+    artifact.generatedAt,
+    artifact.bodyJson,
+    artifact.updatedAt,
+  );
+}
+
 export async function writeHomepageSnapshot(
   db: D1Database,
   now: number,
@@ -796,24 +841,21 @@ export async function writeHomepageSnapshot(
   );
 
   await withTraceAsync(trace, 'homepage_write_batch', async () => {
-    const statements = [
-      homepageSnapshotUpsertStatement(
-        db,
-        SNAPSHOT_KEY,
-        render.generated_at,
-        payloadBodyJson,
-        now,
-      ),
-      homepageSnapshotUpsertStatement(
-        db,
-        SNAPSHOT_ARTIFACT_KEY,
-        render.generated_at,
-        renderBodyJson,
-        now,
-      ),
-    ];
-
-    await db.batch(statements);
+    await homepageSnapshotRowsUpsertStatement(
+      db,
+      {
+        key: SNAPSHOT_KEY,
+        generatedAt: render.generated_at,
+        bodyJson: payloadBodyJson,
+        updatedAt: now,
+      },
+      {
+        key: SNAPSHOT_ARTIFACT_KEY,
+        generatedAt: render.generated_at,
+        bodyJson: renderBodyJson,
+        updatedAt: now,
+      },
+    ).run();
   });
 
   primeHomepageRefreshBaseSnapshotCache({
