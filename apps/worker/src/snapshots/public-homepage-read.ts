@@ -100,6 +100,12 @@ type CandidateReadResult = {
   invalid: boolean;
 };
 
+type PreferredSnapshotReadResult = {
+  row: NormalizedSnapshotRow | null;
+  age: number | null;
+  invalid: boolean;
+};
+
 type RefreshSnapshotReadContext = {
   metadataRows: SnapshotRefreshMetadataRow[];
   readRowByKey: (key: SnapshotKey) => Promise<SnapshotRefreshRow | null>;
@@ -664,6 +670,147 @@ async function readValidatedSnapshotCandidate(opts: {
   };
 }
 
+async function readPreferredSnapshotCandidate(opts: {
+  db: D1Database;
+  key: SnapshotKey;
+  now: number;
+  maxAgeSeconds: number;
+  normalize: (candidate: SnapshotCandidate, bodyJson: string) => string | null;
+  cacheByDb: WeakMap<D1Database, Map<SnapshotKey, NormalizedSnapshotRow>>;
+  globalCache: Map<SnapshotKey, RawNormalizedSnapshotRow>;
+}): Promise<PreferredSnapshotReadResult> {
+  const row = await readRefreshSnapshotRowByKey(opts.db, opts.key);
+  if (!row) {
+    return { row: null, age: null, invalid: false };
+  }
+
+  const candidate: SnapshotCandidate = {
+    key: opts.key,
+    generatedAt: row.generated_at,
+    updatedAt: toSnapshotUpdatedAt(row),
+  };
+  if (isFutureSnapshotCandidate(candidate, opts.now)) {
+    return { row: null, age: null, invalid: false };
+  }
+
+  const age = snapshotCandidateAgeSeconds(candidate, opts.now);
+  if (age > opts.maxAgeSeconds) {
+    return { row: null, age, invalid: false };
+  }
+
+  const result = await readValidatedSnapshotCandidate({
+    db: opts.db,
+    candidate,
+    readRowByKey: async (key) => (key === opts.key ? row : await readRefreshSnapshotRowByKey(opts.db, key)),
+    normalize: opts.normalize,
+    cacheByDb: opts.cacheByDb,
+    globalCache: opts.globalCache,
+  });
+
+  return {
+    row: result.row,
+    age,
+    invalid: result.invalid,
+  };
+}
+
+async function readHomepageSnapshotJsonViaCandidates(
+  db: D1Database,
+  now: number,
+  maxStaleSeconds: number,
+): Promise<{ bodyJson: string; age: number } | null> {
+  const { metadataRows, readRowByKey } = await createRefreshSnapshotReadContext(db);
+  const candidates = listSnapshotCandidatesFromRefreshRows(metadataRows)
+    .filter(
+      (candidate) =>
+        !isFutureSnapshotCandidate(candidate, now) &&
+        snapshotCandidateAgeSeconds(candidate, now) <= maxStaleSeconds,
+    )
+    .sort(comparePayloadCandidates);
+
+  for (const candidate of candidates) {
+    const result = await readValidatedSnapshotCandidate({
+      db,
+      candidate,
+      readRowByKey,
+      normalize: (currentCandidate, bodyJson) =>
+        normalizeHomepagePayloadBodyJsonForKey(currentCandidate.key, bodyJson),
+      cacheByDb: normalizedHomepagePayloadCacheByDb,
+      globalCache: normalizedHomepagePayloadCacheGlobal,
+    });
+    if (!result.row) {
+      if (result.invalid) {
+        console.warn('homepage snapshot: invalid payload');
+      }
+      continue;
+    }
+
+    return {
+      bodyJson: result.row.bodyJson,
+      age: snapshotCandidateAgeSeconds(
+        {
+          key: candidate.key,
+          generatedAt: result.row.generatedAt,
+          updatedAt: result.row.updatedAt,
+        },
+        now,
+      ),
+    };
+  }
+
+  return null;
+}
+
+async function readHomepageArtifactJsonViaCandidates(
+  db: D1Database,
+  now: number,
+  maxAgeSeconds: number,
+): Promise<{ bodyJson: string; age: number } | null> {
+  const { metadataRows, readRowByKey } = await createRefreshSnapshotReadContext(db);
+  const candidates = listSnapshotCandidatesFromRefreshRows(metadataRows)
+    .filter(
+      (candidate) =>
+        !isFutureSnapshotCandidate(candidate, now) &&
+        snapshotCandidateAgeSeconds(candidate, now) <= maxAgeSeconds,
+    )
+    .sort(compareArtifactCandidates);
+
+  for (const candidate of candidates) {
+    const result = await readValidatedSnapshotCandidate({
+      db,
+      candidate,
+      readRowByKey,
+      normalize: (_candidate, bodyJson) => normalizeHomepageArtifactBodyJson(bodyJson),
+      cacheByDb: normalizedHomepageArtifactCacheByDb,
+      globalCache: normalizedHomepageArtifactCacheGlobal,
+    });
+    if (!result.row) {
+      if (result.invalid) {
+        console.warn(
+          maxAgeSeconds > MAX_AGE_SECONDS
+            ? 'homepage snapshot: invalid stale artifact payload'
+            : 'homepage snapshot: invalid artifact payload',
+        );
+      }
+      continue;
+    }
+
+    return {
+      bodyJson: result.row.bodyJson,
+      age: snapshotCandidateAgeSeconds(
+        {
+          key: candidate.key,
+          generatedAt: result.row.generatedAt,
+          updatedAt: result.row.updatedAt,
+        },
+        now,
+      ),
+    };
+  }
+
+  return null;
+}
+
 export async function readHomepageSnapshotGeneratedAt(
   db: D1Database,
   now = Math.floor(Date.now() / 1000),
@@ -1025,46 +1172,26 @@ export async function readHomepageSnapshotJsonAnyAge(
   now: number,
   maxStaleSeconds = MAX_STALE_SECONDS,
 ): Promise<{ bodyJson: string; age: number } | null> {
-  const { metadataRows, readRowByKey } = await createRefreshSnapshotReadContext(db);
-  const candidates = listSnapshotCandidatesFromRefreshRows(metadataRows)
-    .filter(
-      (candidate) =>
-        !isFutureSnapshotCandidate(candidate, now) &&
-        snapshotCandidateAgeSeconds(candidate, now) <= maxStaleSeconds,
-    )
-    .sort(comparePayloadCandidates);
-
-  for (const candidate of candidates) {
-    const result = await readValidatedSnapshotCandidate({
-      db,
-      candidate,
-      readRowByKey,
-      normalize: (currentCandidate, bodyJson) =>
-        normalizeHomepagePayloadBodyJsonForKey(currentCandidate.key, bodyJson),
-      cacheByDb: normalizedHomepagePayloadCacheByDb,
-      globalCache: normalizedHomepagePayloadCacheGlobal,
-    });
-    if (!result.row) {
-      if (result.invalid) {
-        console.warn('homepage snapshot: invalid payload');
-      }
-      continue;
-    }
-
+  const preferred = await readPreferredSnapshotCandidate({
+    db,
+    key: SNAPSHOT_KEY,
+    now,
+    maxAgeSeconds: maxStaleSeconds,
+    normalize: (candidate, bodyJson) => normalizeHomepagePayloadBodyJsonForKey(candidate.key, bodyJson),
+    cacheByDb: normalizedHomepagePayloadCacheByDb,
+    globalCache: normalizedHomepagePayloadCacheGlobal,
+  });
+  if (preferred.row && preferred.age !== null) {
     return {
-      bodyJson: result.row.bodyJson,
-      age: snapshotCandidateAgeSeconds(
-        {
-          key: candidate.key,
-          generatedAt: result.row.generatedAt,
-          updatedAt: result.row.updatedAt,
-        },
-        now,
-      ),
+      bodyJson: preferred.row.bodyJson,
+      age: preferred.age,
     };
   }
+  if (preferred.invalid) {
+    console.warn('homepage snapshot: invalid payload');
+  }
 
-  return null;
+  return await readHomepageSnapshotJsonViaCandidates(db, now, maxStaleSeconds);
 }
 
 export async function readHomepageSnapshotJson(
@@ -1078,90 +1205,52 @@ export async function readHomepageSnapshotArtifactJson(
   db: D1Database,
   now: number,
 ): Promise<{ bodyJson: string; age: number } | null> {
-  const { metadataRows, readRowByKey } = await createRefreshSnapshotReadContext(db);
-  const candidates = listSnapshotCandidatesFromRefreshRows(metadataRows)
-    .filter(
-      (candidate) =>
-        !isFutureSnapshotCandidate(candidate, now) &&
-        snapshotCandidateAgeSeconds(candidate, now) <= MAX_AGE_SECONDS,
-    )
-    .sort(compareArtifactCandidates);
-
-  for (const candidate of candidates) {
-    const result = await readValidatedSnapshotCandidate({
-      db,
-      candidate,
-      readRowByKey,
-      normalize: (_candidate, bodyJson) => normalizeHomepageArtifactBodyJson(bodyJson),
-      cacheByDb: normalizedHomepageArtifactCacheByDb,
-      globalCache: normalizedHomepageArtifactCacheGlobal,
-    });
-    if (!result.row) {
-      if (result.invalid) {
-        console.warn('homepage snapshot: invalid artifact payload');
-      }
-      continue;
-    }
-
+  const preferred = await readPreferredSnapshotCandidate({
+    db,
+    key: SNAPSHOT_ARTIFACT_KEY,
+    now,
+    maxAgeSeconds: MAX_AGE_SECONDS,
+    normalize: (_candidate, bodyJson) => normalizeHomepageArtifactBodyJson(bodyJson),
+    cacheByDb: normalizedHomepageArtifactCacheByDb,
+    globalCache: normalizedHomepageArtifactCacheGlobal,
+  });
+  if (preferred.row && preferred.age !== null) {
     return {
-      bodyJson: result.row.bodyJson,
-      age: snapshotCandidateAgeSeconds(
-        {
-          key: candidate.key,
-          generatedAt: result.row.generatedAt,
-          updatedAt: result.row.updatedAt,
-        },
-        now,
-      ),
+      bodyJson: preferred.row.bodyJson,
+      age: preferred.age,
     };
   }
+  if (preferred.invalid) {
+    console.warn('homepage snapshot: invalid artifact payload');
+  }
 
-  return null;
+  return await readHomepageArtifactJsonViaCandidates(db, now, MAX_AGE_SECONDS);
 }
 
 export async function readStaleHomepageSnapshotArtifactJson(
   db: D1Database,
   now: number,
 ): Promise<{ bodyJson: string; age: number } | null> {
-  const { metadataRows, readRowByKey } = await createRefreshSnapshotReadContext(db);
-  const candidates = listSnapshotCandidatesFromRefreshRows(metadataRows)
-    .filter(
-      (candidate) =>
-        !isFutureSnapshotCandidate(candidate, now) &&
-        snapshotCandidateAgeSeconds(candidate, now) <= MAX_STALE_SECONDS,
-    )
-    .sort(compareArtifactCandidates);
-
-  for (const candidate of candidates) {
-    const result = await readValidatedSnapshotCandidate({
-      db,
-      candidate,
-      readRowByKey,
-      normalize: (_candidate, bodyJson) => normalizeHomepageArtifactBodyJson(bodyJson),
-      cacheByDb: normalizedHomepageArtifactCacheByDb,
-      globalCache: normalizedHomepageArtifactCacheGlobal,
-    });
-    if (!result.row) {
-      if (result.invalid) {
-        console.warn('homepage snapshot: invalid stale artifact payload');
-      }
-      continue;
-    }
-
+  const preferred = await readPreferredSnapshotCandidate({
+    db,
+    key: SNAPSHOT_ARTIFACT_KEY,
+    now,
+    maxAgeSeconds: MAX_STALE_SECONDS,
+    normalize: (_candidate, bodyJson) => normalizeHomepageArtifactBodyJson(bodyJson),
+    cacheByDb: normalizedHomepageArtifactCacheByDb,
+    globalCache: normalizedHomepageArtifactCacheGlobal,
+  });
+  if (preferred.row && preferred.age !== null) {
     return {
-      bodyJson: result.row.bodyJson,
-      age: snapshotCandidateAgeSeconds(
-        {
-          key: candidate.key,
-          generatedAt: result.row.generatedAt,
-          updatedAt: result.row.updatedAt,
-        },
-        now,
-      ),
+      bodyJson: preferred.row.bodyJson,
+      age: preferred.age,
     };
   }
+  if (preferred.invalid) {
+    console.warn('homepage snapshot: invalid stale artifact payload');
+  }
 
-  return null;
+  return await readHomepageArtifactJsonViaCandidates(db, now, MAX_STALE_SECONDS);
 }
 
 export function assertHomepageArtifactAvailable(): never {

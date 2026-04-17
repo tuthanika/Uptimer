@@ -736,7 +736,7 @@ describe('snapshots/public-homepage', () => {
       bodyJson: JSON.stringify(fresherPayload),
       age: 10,
     });
-    expect(metadataReads).toBe(1);
+    expect(metadataReads).toBe(0);
     expect(bodyReads).toEqual(['homepage']);
   });
 

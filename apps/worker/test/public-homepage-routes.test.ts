@@ -436,7 +436,7 @@ describe('public homepage route', () => {
     expect(first.headers.get('Access-Control-Allow-Origin')).toBe('https://one.example.com');
     expect(second.headers.get('Access-Control-Allow-Origin')).toBe('https://two.example.com');
     expect(third.headers.get('Access-Control-Allow-Origin')).toBe('https://one.example.com');
-    expect(metadataReads).toBe(3);
+    expect(metadataReads).toBe(0);
     expect(bodyReads).toEqual(['homepage', 'homepage', 'homepage']);
   });
 
@@ -476,7 +476,7 @@ describe('public homepage route', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual(payload);
-    expect(metadataReads).toBe(1);
+    expect(metadataReads).toBe(0);
     expect(bodyReads).toEqual(['homepage']);
     expect(res.headers.get('Cache-Control')).toContain('max-age=0');
   });
