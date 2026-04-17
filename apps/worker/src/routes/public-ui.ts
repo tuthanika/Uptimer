@@ -17,8 +17,7 @@ import {
   materializeMonitorRuntimeTotals,
   MONITOR_RUNTIME_MAX_AGE_SECONDS,
   MONITOR_RUNTIME_SNAPSHOT_KEY,
-  parsePublicMonitorRuntimeEntry,
-  readPublicMonitorRuntimeSnapshot,
+  publicMonitorRuntimeSnapshotSchema,
   snapshotHasMonitorIds,
   toMonitorRuntimeEntryMap,
 } from '../public/monitor-runtime';
@@ -373,6 +372,28 @@ function safeJsonParse(text: string): unknown | null {
   } catch {
     return null;
   }
+}
+
+function parsePublicMonitorRuntimeSnapshotRow(
+  row: { generated_at: number; body_json: string } | null | undefined,
+  now: number,
+): ReturnType<typeof publicMonitorRuntimeSnapshotSchema['parse']> | null {
+  if (!row || typeof row.generated_at !== 'number' || typeof row.body_json !== 'string') {
+    return null;
+  }
+
+  const age = Math.max(0, now - row.generated_at);
+  if (age > MONITOR_RUNTIME_MAX_AGE_SECONDS) {
+    return null;
+  }
+
+  const parsedJson = safeJsonParse(row.body_json);
+  const parsed = publicMonitorRuntimeSnapshotSchema.safeParse(parsedJson);
+  if (!parsed.success) {
+    return null;
+  }
+
+  return parsed.data.day_start_at === utcDayStart(now) ? parsed.data : null;
 }
 
 function takeBatchRows<T>(result: { results?: unknown[] | undefined } | null | undefined): T[] {
@@ -1376,50 +1397,60 @@ publicUiRoutes.get('/analytics/uptime', async (c) => {
   const rangeEndFullDays = utcDayStart(rangeEnd);
   const rangeStart = rangeEnd - (range === '30d' ? 30 * 86400 : 90 * 86400);
 
-  const { results: monitorRows } = await trace.timeAsync(
-    'monitor_rollups',
+  const [monitorRollupsResult, runtimeSnapshotResult] = await trace.timeAsync(
+    'window_queries',
     async () =>
-      await c.env.DB
-        .prepare(
-          `
-            SELECT
-              m.id,
-              m.name,
-              m.type,
-              COALESCE(SUM(r.total_sec), 0) AS rollup_total_sec,
-              COALESCE(SUM(r.downtime_sec), 0) AS rollup_downtime_sec,
-              COALESCE(SUM(r.unknown_sec), 0) AS rollup_unknown_sec,
-              COALESCE(SUM(r.uptime_sec), 0) AS rollup_uptime_sec
-            FROM monitors m
-            LEFT JOIN monitor_daily_rollups r
-              ON r.monitor_id = m.id
-             AND r.day_start_at >= ?1
-             AND r.day_start_at < ?2
-            WHERE m.is_active = 1
-              AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
-            GROUP BY m.id, m.name, m.type
-            ORDER BY m.id
-          `,
-        )
-        .bind(rangeStart, rangeEndFullDays)
-        .all<{
-          id: number;
-          name: string;
-          type: string;
-          rollup_total_sec: number | null;
-          rollup_downtime_sec: number | null;
-          rollup_unknown_sec: number | null;
-          rollup_uptime_sec: number | null;
-        }>(),
+      await c.env.DB.batch([
+        c.env.DB
+          .prepare(
+            `
+              SELECT
+                m.id,
+                m.name,
+                m.type,
+                COALESCE(SUM(r.total_sec), 0) AS rollup_total_sec,
+                COALESCE(SUM(r.downtime_sec), 0) AS rollup_downtime_sec,
+                COALESCE(SUM(r.unknown_sec), 0) AS rollup_unknown_sec,
+                COALESCE(SUM(r.uptime_sec), 0) AS rollup_uptime_sec
+              FROM monitors m
+              LEFT JOIN monitor_daily_rollups r
+                ON r.monitor_id = m.id
+               AND r.day_start_at >= ?1
+               AND r.day_start_at < ?2
+              WHERE m.is_active = 1
+                AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
+              GROUP BY m.id, m.name, m.type
+              ORDER BY m.id
+            `,
+          )
+          .bind(rangeStart, rangeEndFullDays),
+        c.env.DB
+          .prepare(
+            `
+              SELECT generated_at, body_json
+              FROM public_snapshots
+              WHERE key = ?1
+            `,
+          )
+          .bind(MONITOR_RUNTIME_SNAPSHOT_KEY),
+      ]),
   );
 
-  const monitors = monitorRows ?? [];
+  const monitors = takeBatchRows<{
+    id: number;
+    name: string;
+    type: string;
+    rollup_total_sec: number | null;
+    rollup_downtime_sec: number | null;
+    rollup_unknown_sec: number | null;
+    rollup_uptime_sec: number | null;
+  }>(monitorRollupsResult);
   const monitorIds = monitors.map((monitor) => monitor.id);
   const runtimeSnapshot =
     monitorIds.length > 0
-      ? await trace.timeAsync(
-          'runtime_snapshot',
-          async () => await readPublicMonitorRuntimeSnapshot(c.env.DB, rangeEnd),
+      ? parsePublicMonitorRuntimeSnapshotRow(
+          takeBatchFirstRow<{ generated_at: number; body_json: string }>(runtimeSnapshotResult),
+          rangeEnd,
         )
       : null;
   if (monitorIds.length > 0 && (!runtimeSnapshot || !snapshotHasMonitorIds(runtimeSnapshot, monitorIds))) {
@@ -1502,40 +1533,14 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
   trace.setLabel('monitor_id', id);
   trace.setLabel('range', range);
 
-  const monitor = await trace.timeAsync(
-    'monitor_lookup',
-    async () =>
-      await c.env.DB
-        .prepare(
-          `
-            SELECT m.id, m.name, m.interval_sec, m.created_at, s.last_checked_at
-            FROM monitors m
-            LEFT JOIN monitor_state s ON s.monitor_id = m.id
-            WHERE m.id = ?1 AND m.is_active = 1
-              AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
-          `,
-        )
-        .bind(id)
-        .first<{
-          id: number;
-          name: string;
-          interval_sec: number;
-          created_at: number;
-          last_checked_at: number | null;
-        }>(),
-  );
-  if (!monitor) {
-    throw new AppError(404, 'NOT_FOUND', 'Monitor not found');
-  }
-
   const now = Math.floor(Date.now() / 1000);
   const rangeEnd = Math.floor(now / 60) * 60;
   const requestedRangeStart = rangeEnd - rangeToSeconds(range);
-  const rangeStart = Math.max(requestedRangeStart, monitor.created_at);
-  const startDay = utcDayStart(rangeStart);
+  const startDay = utcDayStart(requestedRangeStart);
   const endDay = utcDayStart(rangeEnd);
   const windowBatchStatements: D1PreparedStatement[] = [];
   const windowIndexes = {
+    monitor: -1,
     firstCheck: -1,
     startPartial: -1,
     singlePartial: -1,
@@ -1543,24 +1548,37 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
     runtime: -1,
   };
 
-  if (monitor.created_at > rangeStart) {
-    windowIndexes.firstCheck = windowBatchStatements.length;
-    windowBatchStatements.push(
-      c.env.DB
-        .prepare(
-          `
-            SELECT checked_at
-            FROM check_results
-            WHERE monitor_id = ?1
-              AND checked_at >= ?2
-              AND checked_at < ?3
-            ORDER BY checked_at
-            LIMIT 1
-          `,
-        )
-        .bind(monitor.id, monitor.created_at, rangeEnd),
-    );
-  }
+  windowIndexes.monitor = windowBatchStatements.length;
+  windowBatchStatements.push(
+    c.env.DB
+      .prepare(
+        `
+          SELECT m.id, m.name, m.interval_sec, m.created_at, s.last_checked_at
+          FROM monitors m
+          LEFT JOIN monitor_state s ON s.monitor_id = m.id
+          WHERE m.id = ?1 AND m.is_active = 1
+            AND ${monitorVisibilityPredicate(includeHiddenMonitors, 'm')}
+        `,
+      )
+      .bind(id),
+  );
+
+  windowIndexes.firstCheck = windowBatchStatements.length;
+  windowBatchStatements.push(
+    c.env.DB
+      .prepare(
+        `
+          SELECT checked_at
+          FROM check_results
+          WHERE monitor_id = ?1
+            AND checked_at >= ?2
+            AND checked_at < ?3
+          ORDER BY checked_at
+          LIMIT 1
+        `,
+      )
+      .bind(id, requestedRangeStart, rangeEnd),
+  );
 
   if (startDay === endDay) {
     windowIndexes.singlePartial = windowBatchStatements.length;
@@ -1569,7 +1587,10 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
         .prepare(
           `
             WITH input(monitor_id, interval_sec, created_at, last_checked_at) AS (
-              VALUES (?3, ?4, ?5, ?6)
+              SELECT m.id, m.interval_sec, m.created_at, s.last_checked_at
+              FROM monitors m
+              LEFT JOIN monitor_state s ON s.monitor_id = m.id
+              WHERE m.id = ?3
             ),
             first_checks AS (
               SELECT monitor_id, MIN(checked_at) AS first_check_at
@@ -1727,7 +1748,7 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
             WHERE e.start_at IS NOT NULL
           `,
         )
-        .bind(rangeStart, rangeEnd, monitor.id, monitor.interval_sec, monitor.created_at, monitor.last_checked_at),
+        .bind(requestedRangeStart, rangeEnd, id),
     );
   } else {
     const startPartialEnd = Math.min(rangeEnd, startDay + 86400);
@@ -1737,7 +1758,10 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
         .prepare(
           `
             WITH input(monitor_id, interval_sec, created_at, last_checked_at) AS (
-              VALUES (?3, ?4, ?5, ?6)
+              SELECT m.id, m.interval_sec, m.created_at, s.last_checked_at
+              FROM monitors m
+              LEFT JOIN monitor_state s ON s.monitor_id = m.id
+              WHERE m.id = ?3
             ),
             first_checks AS (
               SELECT monitor_id, MIN(checked_at) AS first_check_at
@@ -1895,10 +1919,10 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
             WHERE e.start_at IS NOT NULL
           `,
         )
-        .bind(rangeStart, startPartialEnd, monitor.id, monitor.interval_sec, monitor.created_at, monitor.last_checked_at),
+        .bind(requestedRangeStart, startPartialEnd, id),
     );
 
-    const fullDaysStart = Math.max(startDay + 86400, rangeStart);
+    const fullDaysStart = startDay + 86400;
     const fullDaysEnd = endDay;
     if (fullDaysStart < fullDaysEnd) {
       windowIndexes.rollup = windowBatchStatements.length;
@@ -1917,7 +1941,7 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
                 AND day_start_at < ?3
             `,
           )
-          .bind(monitor.id, fullDaysStart, fullDaysEnd),
+          .bind(id, fullDaysStart, fullDaysEnd),
       );
     }
 
@@ -1929,18 +1953,12 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
             `
               SELECT
                 generated_at,
-                CAST(json_extract(body_json, '$.day_start_at') AS INTEGER) AS day_start_at,
-                (
-                  SELECT entry.value
-                  FROM json_each(public_snapshots.body_json, '$.monitors') AS entry
-                  WHERE CAST(json_extract(entry.value, '$.monitor_id') AS INTEGER) = ?2
-                  LIMIT 1
-                ) AS monitor_json
+                body_json
               FROM public_snapshots
               WHERE key = ?1
             `,
           )
-          .bind(MONITOR_RUNTIME_SNAPSHOT_KEY, monitor.id),
+          .bind(MONITOR_RUNTIME_SNAPSHOT_KEY),
       );
     }
   }
@@ -1950,10 +1968,24 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
       ? []
       : await trace.timeAsync('window_queries', async () => await c.env.DB.batch(windowBatchStatements));
 
+  const monitor = takeBatchFirstRow<{
+    id: number;
+    name: string;
+    interval_sec: number;
+    created_at: number;
+    last_checked_at: number | null;
+  }>(windowResults[windowIndexes.monitor]);
+  if (!monitor) {
+    throw new AppError(404, 'NOT_FOUND', 'Monitor not found');
+  }
+
+  const rangeStart = Math.max(requestedRangeStart, monitor.created_at);
+  const firstCheckCandidate =
+    takeBatchFirstRow<{ checked_at: number }>(windowResults[windowIndexes.firstCheck])?.checked_at ?? null;
   const firstCheckAt =
-    windowIndexes.firstCheck === -1
-      ? null
-      : takeBatchFirstRow<{ checked_at: number }>(windowResults[windowIndexes.firstCheck])?.checked_at ?? null;
+    typeof firstCheckCandidate === 'number' && firstCheckCandidate >= monitor.created_at
+      ? firstCheckCandidate
+      : null;
   const effectiveRangeStart = resolveUptimeRangeStartFromFirstCheck({
     rangeStart,
     rangeEnd,
@@ -2049,19 +2081,15 @@ publicUiRoutes.get('/monitors/:id/uptime', async (c) => {
       });
     }
 
-    const runtimeEntryRow = takeBatchFirstRow<{
-      generated_at: number;
-      day_start_at: number | null;
-      monitor_json: string | null;
-    }>(windowIndexes.runtime === -1 ? null : windowResults[windowIndexes.runtime]);
-    const runtimeEntry =
-      runtimeEntryRow &&
-      typeof runtimeEntryRow.generated_at === 'number' &&
-      Math.max(0, rangeEnd - runtimeEntryRow.generated_at) <= MONITOR_RUNTIME_MAX_AGE_SECONDS &&
-      runtimeEntryRow.day_start_at === utcDayStart(rangeEnd) &&
-      typeof runtimeEntryRow.monitor_json === 'string'
-        ? parsePublicMonitorRuntimeEntry(safeJsonParse(runtimeEntryRow.monitor_json))
-        : null;
+    const runtimeSnapshot = parsePublicMonitorRuntimeSnapshotRow(
+      takeBatchFirstRow<{ generated_at: number; body_json: string }>(
+        windowIndexes.runtime === -1 ? null : windowResults[windowIndexes.runtime],
+      ),
+      rangeEnd,
+    );
+    const runtimeEntry = runtimeSnapshot
+      ? (toMonitorRuntimeEntryMap(runtimeSnapshot).get(monitor.id) ?? null)
+      : null;
 
     if (runtimeEntry) {
       addUptimeTotals(totals, materializeMonitorRuntimeTotals(runtimeEntry, rangeEnd));

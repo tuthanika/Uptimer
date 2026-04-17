@@ -67,7 +67,10 @@ describe('public ui routes', () => {
 
     const handlers: FakeD1QueryHandler[] = [
       {
-        match: (sql) => sql.includes('from monitors m') && sql.includes('left join monitor_state'),
+        match: (sql) =>
+          sql.includes('from monitors m') &&
+          sql.includes('left join monitor_state') &&
+          !sql.includes('with input'),
         first: () => ({
           id: 12,
           name: 'Legacy Monitor',
@@ -75,6 +78,13 @@ describe('public ui routes', () => {
           created_at: rangeStart - 5 * 86_400,
           last_checked_at: rangeEnd - 60,
         }),
+      },
+      {
+        match: (sql) =>
+          sql.includes('select checked_at') &&
+          sql.includes('from check_results') &&
+          sql.includes('order by checked_at'),
+        first: () => null,
       },
       {
         match: (sql) =>
