@@ -35,11 +35,38 @@ const UPSERT_SNAPSHOT_SQL = `
   WHERE excluded.generated_at >= public_snapshots.generated_at
     OR public_snapshots.generated_at > ?5
 `;
+const UPSERT_SNAPSHOT_WHILE_LEASE_SQL = `
+  INSERT INTO public_snapshots (key, generated_at, body_json, updated_at)
+  SELECT ?1, ?2, ?3, ?4
+  WHERE EXISTS (
+    SELECT 1
+    FROM locks refresh_lock
+    WHERE refresh_lock.name = ?6
+      AND refresh_lock.expires_at = ?7
+      AND refresh_lock.expires_at > CAST(strftime('%s', 'now') AS INTEGER)
+  )
+  ON CONFLICT(key) DO UPDATE SET
+    generated_at = excluded.generated_at,
+    body_json = excluded.body_json,
+    updated_at = excluded.updated_at
+  WHERE (
+      excluded.generated_at >= public_snapshots.generated_at
+      OR public_snapshots.generated_at > ?5
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM locks refresh_lock
+      WHERE refresh_lock.name = ?6
+        AND refresh_lock.expires_at = ?7
+        AND refresh_lock.expires_at > CAST(strftime('%s', 'now') AS INTEGER)
+    )
+`;
 const SPLIT_SNAPSHOT_VERSION = 3;
 const LEGACY_COMBINED_SNAPSHOT_VERSION = 2;
 
 const readSnapshotStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const upsertSnapshotStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+const upsertSnapshotWhileLeaseStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 
 function withTraceSync<T>(trace: Trace | undefined, name: string, fn: () => T): T {
   return trace ? trace.time(name, fn) : fn();
@@ -781,14 +808,26 @@ function homepageSnapshotUpsertStatement(
   bodyJson: string,
   updatedAt: number,
   futureCutoffAt: number,
+  lease?: {
+    name: string;
+    expiresAt: number;
+  },
 ): D1PreparedStatement {
-  const cached = upsertSnapshotStatementByDb.get(db);
-  const statement = cached ?? db.prepare(UPSERT_SNAPSHOT_SQL);
+  const cached = lease
+    ? upsertSnapshotWhileLeaseStatementByDb.get(db)
+    : upsertSnapshotStatementByDb.get(db);
+  const statement = cached ?? db.prepare(lease ? UPSERT_SNAPSHOT_WHILE_LEASE_SQL : UPSERT_SNAPSHOT_SQL);
   if (!cached) {
-    upsertSnapshotStatementByDb.set(db, statement);
+    if (lease) {
+      upsertSnapshotWhileLeaseStatementByDb.set(db, statement);
+    } else {
+      upsertSnapshotStatementByDb.set(db, statement);
+    }
   }
 
-  return statement.bind(key, generatedAt, bodyJson, updatedAt, futureCutoffAt);
+  return lease
+    ? statement.bind(key, generatedAt, bodyJson, updatedAt, futureCutoffAt, lease.name, lease.expiresAt)
+    : statement.bind(key, generatedAt, bodyJson, updatedAt, futureCutoffAt);
 }
 
 function didApplySnapshotWrite(
@@ -842,6 +881,10 @@ export function prepareHomepageSnapshotWrite(
   payload: PublicHomepageResponse,
   trace?: Trace,
   _seedDataSnapshot = false,
+  lease?: {
+    name: string;
+    expiresAt: number;
+  },
 ): PreparedHomepageSnapshotWrite {
   const payloadBodyJson = withTraceSync(trace, 'homepage_write_stringify_payload', () =>
     JSON.stringify(payload),
@@ -861,6 +904,7 @@ export function prepareHomepageSnapshotWrite(
       renderBodyJson,
       now,
       now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS,
+      lease,
     ),
     generatedAt: render.generated_at,
     prime: () => {

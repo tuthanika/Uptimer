@@ -221,6 +221,10 @@ describe('internal homepage refresh route', () => {
       fastPayload,
       undefined,
       false,
+      {
+        name: 'snapshot:homepage:refresh',
+        expiresAt: now + 55,
+      },
     );
     expect(homepageWritePrime).toHaveBeenCalledTimes(1);
     expect(tryComputePublicStatusPayloadFromScheduledRuntimeUpdates).toHaveBeenCalledWith({
@@ -447,6 +451,10 @@ describe('internal homepage refresh route', () => {
       fastPayload,
       undefined,
       false,
+      {
+        name: 'snapshot:homepage:refresh',
+        expiresAt: now + 55,
+      },
     );
   });
 
@@ -618,6 +626,10 @@ describe('internal homepage refresh route', () => {
       computedPayload,
       undefined,
       false,
+      {
+        name: 'snapshot:homepage:refresh',
+        expiresAt: now + 55,
+      },
     );
     expect(releaseLease).toHaveBeenCalledWith(env.DB, 'snapshot:homepage:refresh', now + 55);
   });
@@ -667,6 +679,10 @@ describe('internal homepage refresh route', () => {
       fastPayload,
       undefined,
       false,
+      {
+        name: 'snapshot:homepage:refresh',
+        expiresAt: now + 55,
+      },
     );
   });
 

@@ -20,6 +20,7 @@ import {
   readStaleHomepageSnapshotArtifact,
   refreshPublicHomepageSnapshotIfNeeded,
   toHomepageSnapshotPayload,
+  prepareHomepageSnapshotWrite,
   writeHomepageArtifactSnapshot,
   writeHomepageSnapshot,
 } from '../src/snapshots/public-homepage';
@@ -255,6 +256,41 @@ describe('snapshots/public-homepage', () => {
     expect(boundArgs).toEqual([
       ['homepage:artifact', 280, JSON.stringify(storedRender), 300, 360],
     ]);
+  });
+
+  it('can bind homepage artifact writes to the current refresh lease', async () => {
+    let normalizedSql = '';
+    let boundArgs: unknown[] | null = null;
+    const db = createFakeD1Database([
+      {
+        match: 'insert into public_snapshots',
+        run: (args, sql) => {
+          boundArgs = args;
+          normalizedSql = sql;
+          return { meta: { changes: 1 } };
+        },
+      },
+    ]);
+
+    const payload = samplePayload(280);
+    const prepared = prepareHomepageSnapshotWrite(db, 300, payload, undefined, false, {
+      name: 'snapshot:homepage:refresh',
+      expiresAt: 355,
+    });
+    await prepared.statement.run();
+
+    expect(boundArgs).toEqual([
+      'homepage:artifact',
+      280,
+      JSON.stringify(buildHomepageRenderArtifact(payload)),
+      300,
+      360,
+      'snapshot:homepage:refresh',
+      355,
+    ]);
+    expect(normalizedSql).toContain('from locks refresh_lock');
+    expect(normalizedSql).toContain('refresh_lock.expires_at = ?7');
+    expect(normalizedSql).toContain("refresh_lock.expires_at > cast(strftime('%s', 'now') as integer)");
   });
 
   it('does not let an older homepage snapshot overwrite a newer one', async () => {

@@ -62,6 +62,7 @@ const UPSERT_STATUS_AFTER_HOMEPAGE_AND_LEASE_SQL = `
       FROM locks refresh_lock
       WHERE refresh_lock.name = ?9
         AND refresh_lock.expires_at = ?10
+        AND refresh_lock.expires_at > CAST(strftime('%s', 'now') AS INTEGER)
     )
   ON CONFLICT(key) DO UPDATE SET
     generated_at = excluded.generated_at,
@@ -83,6 +84,7 @@ const UPSERT_STATUS_AFTER_HOMEPAGE_AND_LEASE_SQL = `
       FROM locks refresh_lock
       WHERE refresh_lock.name = ?9
         AND refresh_lock.expires_at = ?10
+        AND refresh_lock.expires_at > CAST(strftime('%s', 'now') AS INTEGER)
     )
 `;
 

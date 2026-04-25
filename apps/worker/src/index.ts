@@ -779,6 +779,10 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       payload,
       trace ?? undefined,
       baseSnapshot.seedDataSnapshot,
+      {
+        name: HOMEPAGE_REFRESH_LOCK_NAME,
+        expiresAt: homepageRefreshLease.getExpiresAt(),
+      },
     );
     const preparedStatusWrite = refreshedStatusPayload
       ? statusSnapshotMod.prepareStatusSnapshotWrite({

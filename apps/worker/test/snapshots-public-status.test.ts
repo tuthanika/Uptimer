@@ -282,11 +282,13 @@ describe('snapshots/public-status', () => {
 
   it('prepares conditional status writes tied to the homepage artifact and lease', async () => {
     let boundArgs: unknown[] | null = null;
+    let normalizedSql = '';
     const db = createFakeD1Database([
       {
         match: 'insert into public_snapshots',
-        run: (args) => {
+        run: (args, sql) => {
           boundArgs = args;
+          normalizedSql = sql;
           return { meta: { changes: 1 } };
         },
       },
@@ -322,6 +324,9 @@ describe('snapshots/public-status', () => {
       'snapshot:homepage:refresh',
       now + 55,
     ]);
+    expect(normalizedSql).toContain('from locks refresh_lock');
+    expect(normalizedSql).toContain('refresh_lock.expires_at = ?10');
+    expect(normalizedSql).toContain("refresh_lock.expires_at > cast(strftime('%s', 'now') as integer)");
   });
 
   it('reports conditional status writes as skipped when homepage or lease guards do not match', async () => {
