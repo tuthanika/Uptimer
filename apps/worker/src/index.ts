@@ -790,6 +790,10 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
             key: snapshotMod.getHomepageSnapshotArtifactKey(),
             generatedAt: preparedHomepageWrite.generatedAt,
             updatedAt: now,
+            lease: {
+              name: HOMEPAGE_REFRESH_LOCK_NAME,
+              expiresAt: homepageRefreshLease.getExpiresAt(),
+            },
           },
         })
       : null;
@@ -804,6 +808,7 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       : preparedStatusWrite
         ? await env.DB.batch([preparedHomepageWrite.statement, preparedStatusWrite.statement])
         : [await preparedHomepageWrite.statement.run()];
+    homepageRefreshLease.assertHeld('finalizing snapshot writes');
     const homepageWriteResult = writeResults[0];
     if (!homepageWriteResult) {
       throw new Error('homepage snapshot write returned no result');
@@ -821,9 +826,15 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       );
     }
     preparedHomepageWrite.prime();
-    if (refreshedStatusPayload) {
+    const statusWriteResult = writeResults[1];
+    if (
+      refreshedStatusPayload &&
+      statusSnapshotMod.didApplyStatusSnapshotWrite(statusWriteResult)
+    ) {
       preparedStatusWrite?.prime();
       trace?.setLabel('status_refresh', 'patched');
+    } else if (refreshedStatusPayload) {
+      trace?.setLabel('status_refresh', 'skipped_after_homepage_write');
     } else {
       trace?.setLabel('status_refresh', 'skipped');
     }

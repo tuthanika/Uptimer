@@ -22,6 +22,7 @@ vi.mock('../src/snapshots/public-homepage', () => ({
 vi.mock('../src/snapshots/public-status', () => ({
   writeStatusSnapshot: vi.fn(),
   prepareStatusSnapshotWrite: vi.fn(),
+  didApplyStatusSnapshotWrite: vi.fn(),
 }));
 
 import type { Env } from '../src/env';
@@ -38,7 +39,7 @@ import {
   toHomepageSnapshotPayload,
   writeHomepageSnapshot,
 } from '../src/snapshots/public-homepage';
-import { prepareStatusSnapshotWrite } from '../src/snapshots/public-status';
+import { didApplyStatusSnapshotWrite, prepareStatusSnapshotWrite } from '../src/snapshots/public-status';
 import { createFakeD1Database } from './helpers/fake-d1';
 
 function createBaseSnapshot(now: number) {
@@ -159,6 +160,7 @@ describe('internal homepage refresh route', () => {
       } as unknown as D1PreparedStatement,
       prime: statusWritePrime,
     });
+    vi.mocked(didApplyStatusSnapshotWrite).mockReturnValue(true);
     vi.mocked(tryComputePublicStatusPayloadFromScheduledRuntimeUpdates).mockResolvedValue(
       null as never,
     );
@@ -330,6 +332,10 @@ describe('internal homepage refresh route', () => {
         key: 'homepage:artifact',
         generatedAt: 1_776_230_340,
         updatedAt: now,
+        lease: {
+          name: 'snapshot:homepage:refresh',
+          expiresAt: now + 55,
+        },
       },
     });
     expect(statusWritePrime).toHaveBeenCalledTimes(1);
@@ -750,6 +756,144 @@ describe('internal homepage refresh route', () => {
     expect(prepareStatusSnapshotWrite).not.toHaveBeenCalled();
   });
 
+  it('does not prime status cache when a batched homepage snapshot write is a no-op', async () => {
+    const now = 1_776_230_340;
+    vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
+    const env = createEnv(now);
+    const baseSnapshot = createBaseSnapshot(now);
+    vi.mocked(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates).mockResolvedValue(
+      {
+        ...baseSnapshot,
+        generated_at: now,
+      } as never,
+    );
+    vi.mocked(tryComputePublicStatusPayloadFromScheduledRuntimeUpdates).mockResolvedValue({
+      generated_at: now,
+      site_title: 'Status Hub',
+      site_description: 'Production services',
+      site_locale: 'en',
+      site_timezone: 'UTC',
+      uptime_rating_level: 4,
+      overall_status: 'up',
+      banner: {
+        source: 'monitors',
+        status: 'operational',
+        title: 'All Systems Operational',
+        down_ratio: null,
+      },
+      summary: {
+        up: 1,
+        down: 0,
+        maintenance: 0,
+        paused: 0,
+        unknown: 0,
+      },
+      monitors: [],
+      active_incidents: [],
+      maintenance_windows: {
+        active: [],
+        upcoming: [],
+      },
+    } as never);
+    vi.mocked(didApplyHomepageSnapshotWrite).mockReturnValue(false);
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/refresh/homepage', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+          'X-Uptimer-Refresh-Source': 'scheduled',
+        },
+        body: JSON.stringify({
+          token: 'test-admin-token',
+          runtime_updates: [[1, 60, now - 300, now, 'up', 'up', 55]],
+        }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ ok: true, refreshed: false });
+    expect(prepareStatusSnapshotWrite).toHaveBeenCalledTimes(1);
+    expect(homepageWritePrime).not.toHaveBeenCalled();
+    expect(statusWritePrime).not.toHaveBeenCalled();
+  });
+
+  it('fails closed and skips cache priming when the lease expires during batched snapshot writes', async () => {
+    const now = 1_776_230_340;
+    let currentNowMs = now * 1000;
+    vi.spyOn(Date, 'now').mockImplementation(() => currentNowMs);
+    const env = createEnv(now);
+    const baseSnapshot = createBaseSnapshot(now);
+    vi.mocked(tryComputePublicHomepagePayloadFromScheduledRuntimeUpdates).mockResolvedValue(
+      {
+        ...baseSnapshot,
+        generated_at: now,
+      } as never,
+    );
+    vi.mocked(tryComputePublicStatusPayloadFromScheduledRuntimeUpdates).mockResolvedValue({
+      generated_at: now,
+      site_title: 'Status Hub',
+      site_description: 'Production services',
+      site_locale: 'en',
+      site_timezone: 'UTC',
+      uptime_rating_level: 4,
+      overall_status: 'up',
+      banner: {
+        source: 'monitors',
+        status: 'operational',
+        title: 'All Systems Operational',
+        down_ratio: null,
+      },
+      summary: {
+        up: 1,
+        down: 0,
+        maintenance: 0,
+        paused: 0,
+        unknown: 0,
+      },
+      monitors: [],
+      active_incidents: [],
+      maintenance_windows: {
+        active: [],
+        upcoming: [],
+      },
+    } as never);
+    vi.mocked(prepareStatusSnapshotWrite).mockReturnValue({
+      statement: {
+        run: vi.fn(async () => {
+          currentNowMs = (now + 56) * 1000;
+          return { meta: { changes: 1 } };
+        }),
+      } as unknown as D1PreparedStatement,
+      prime: statusWritePrime,
+    });
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/refresh/homepage', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+          'X-Uptimer-Refresh-Source': 'scheduled',
+        },
+        body: JSON.stringify({
+          token: 'test-admin-token',
+          runtime_updates: [[1, 60, now - 300, now, 'up', 'up', 55]],
+        }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({ ok: true, refreshed: false });
+    expect(homepageWritePrime).not.toHaveBeenCalled();
+    expect(statusWritePrime).not.toHaveBeenCalled();
+  });
+
   it('drops stale scheduled runtime updates before attempting the fast path', async () => {
     const now = 1_776_230_340;
     vi.spyOn(Date, 'now').mockReturnValue(now * 1000);
@@ -1135,6 +1279,34 @@ describe('internal homepage refresh route', () => {
         generated_at: now,
       } as never,
     );
+    vi.mocked(tryComputePublicStatusPayloadFromScheduledRuntimeUpdates).mockResolvedValue({
+      generated_at: now,
+      site_title: 'Status Hub',
+      site_description: 'Production services',
+      site_locale: 'en',
+      site_timezone: 'UTC',
+      uptime_rating_level: 4,
+      overall_status: 'up',
+      banner: {
+        source: 'monitors',
+        status: 'operational',
+        title: 'All Systems Operational',
+        down_ratio: null,
+      },
+      summary: {
+        up: 1,
+        down: 0,
+        maintenance: 0,
+        paused: 0,
+        unknown: 0,
+      },
+      monitors: [],
+      active_incidents: [],
+      maintenance_windows: {
+        active: [],
+        upcoming: [],
+      },
+    } as never);
 
     const res = await worker.fetch(
       new Request('http://internal/api/v1/internal/refresh/homepage', {
@@ -1163,6 +1335,8 @@ describe('internal homepage refresh route', () => {
     expect(res.headers.get('X-Uptimer-Trace')).toContain('runtime_updates_fast_path_count=1');
     expect(res.headers.get('X-Uptimer-Trace')).toContain('skip_initial_freshness_check=1');
     expect(res.headers.get('X-Uptimer-Trace')).toContain('fast_path=scheduled_runtime');
+    expect(res.headers.get('X-Uptimer-Trace')).toContain('status_refresh=patched');
+    expect(res.headers.get('Server-Timing')).toContain('w_snapshot_writes_batch');
     expect(res.headers.get('Server-Timing')).toContain('w_total');
     expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining('internal-refresh:'));
   });

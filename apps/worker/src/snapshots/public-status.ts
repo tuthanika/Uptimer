@@ -47,10 +47,52 @@ const UPSERT_STATUS_AFTER_HOMEPAGE_SQL = `
         AND homepage_snapshot.updated_at = ?8
     )
 `;
+const UPSERT_STATUS_AFTER_HOMEPAGE_AND_LEASE_SQL = `
+  INSERT INTO public_snapshots (key, generated_at, body_json, updated_at)
+  SELECT ?1, ?2, ?3, ?4
+  WHERE EXISTS (
+    SELECT 1
+    FROM public_snapshots homepage_snapshot
+    WHERE homepage_snapshot.key = ?6
+      AND homepage_snapshot.generated_at = ?7
+      AND homepage_snapshot.updated_at = ?8
+  )
+    AND EXISTS (
+      SELECT 1
+      FROM locks refresh_lock
+      WHERE refresh_lock.name = ?9
+        AND refresh_lock.expires_at = ?10
+    )
+  ON CONFLICT(key) DO UPDATE SET
+    generated_at = excluded.generated_at,
+    body_json = excluded.body_json,
+    updated_at = excluded.updated_at
+  WHERE (
+      excluded.generated_at >= public_snapshots.generated_at
+      OR public_snapshots.generated_at > ?5
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM public_snapshots homepage_snapshot
+      WHERE homepage_snapshot.key = ?6
+        AND homepage_snapshot.generated_at = ?7
+        AND homepage_snapshot.updated_at = ?8
+    )
+    AND EXISTS (
+      SELECT 1
+      FROM locks refresh_lock
+      WHERE refresh_lock.name = ?9
+        AND refresh_lock.expires_at = ?10
+    )
+`;
 
 const readStatusStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const upsertStatusStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const upsertStatusAfterHomepageStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+const upsertStatusAfterHomepageAndLeaseStatementByDb = new WeakMap<
+  D1Database,
+  D1PreparedStatement
+>();
 
 function withTraceSync<T>(trace: Trace | undefined, name: string, fn: () => T): T {
   return trace ? trace.time(name, fn) : fn();
@@ -177,12 +219,24 @@ export async function writeStatusSnapshot(
   trace?: Trace,
 ): Promise<void> {
   const prepared = prepareStatusSnapshotWrite({ db, now, payload, ...(trace ? { trace } : {}) });
-  prepared.prime();
-  await withTraceAsync(
+  const result = await withTraceAsync(
     trace,
     'status_write_run',
     async () => await prepared.statement.run(),
   );
+  if (didApplyStatusSnapshotWrite(result)) {
+    prepared.prime();
+  }
+}
+
+export function didApplyStatusSnapshotWrite(
+  result: Awaited<ReturnType<D1PreparedStatement['run']>> | undefined,
+): boolean {
+  const changes = result?.meta?.changes;
+  if (typeof changes === 'number' && Number.isFinite(changes)) {
+    return changes > 0;
+  }
+  return result !== undefined;
 }
 
 export type PreparedStatusSnapshotWrite = {
@@ -219,14 +273,28 @@ function bindStatusSnapshotAfterHomepageUpsert(opts: {
   homepageSnapshotKey: string;
   homepageGeneratedAt: number;
   homepageUpdatedAt: number;
+  homepageLease?: {
+    name: string;
+    expiresAt: number;
+  };
 }): D1PreparedStatement {
-  const cached = upsertStatusAfterHomepageStatementByDb.get(opts.db);
-  const statement = cached ?? opts.db.prepare(UPSERT_STATUS_AFTER_HOMEPAGE_SQL);
+  const cached = opts.homepageLease
+    ? upsertStatusAfterHomepageAndLeaseStatementByDb.get(opts.db)
+    : upsertStatusAfterHomepageStatementByDb.get(opts.db);
+  const statement = cached ?? opts.db.prepare(
+    opts.homepageLease
+      ? UPSERT_STATUS_AFTER_HOMEPAGE_AND_LEASE_SQL
+      : UPSERT_STATUS_AFTER_HOMEPAGE_SQL,
+  );
   if (!cached) {
-    upsertStatusAfterHomepageStatementByDb.set(opts.db, statement);
+    if (opts.homepageLease) {
+      upsertStatusAfterHomepageAndLeaseStatementByDb.set(opts.db, statement);
+    } else {
+      upsertStatusAfterHomepageStatementByDb.set(opts.db, statement);
+    }
   }
 
-  return statement.bind(
+  const args = [
     SNAPSHOT_KEY,
     opts.generatedAt,
     opts.bodyJson,
@@ -235,7 +303,12 @@ function bindStatusSnapshotAfterHomepageUpsert(opts: {
     opts.homepageSnapshotKey,
     opts.homepageGeneratedAt,
     opts.homepageUpdatedAt,
-  );
+  ];
+  if (opts.homepageLease) {
+    args.push(opts.homepageLease.name, opts.homepageLease.expiresAt);
+  }
+
+  return statement.bind(...args);
 }
 
 export function prepareStatusSnapshotWrite(opts: {
@@ -247,6 +320,10 @@ export function prepareStatusSnapshotWrite(opts: {
     key: string;
     generatedAt: number;
     updatedAt: number;
+    lease?: {
+      name: string;
+      expiresAt: number;
+    };
   };
 }): PreparedStatusSnapshotWrite {
   const bodyJson = withTraceSync(opts.trace, 'status_write_stringify', () =>
@@ -261,6 +338,7 @@ export function prepareStatusSnapshotWrite(opts: {
         homepageSnapshotKey: opts.afterHomepage.key,
         homepageGeneratedAt: opts.afterHomepage.generatedAt,
         homepageUpdatedAt: opts.afterHomepage.updatedAt,
+        ...(opts.afterHomepage.lease ? { homepageLease: opts.afterHomepage.lease } : {}),
       })
     : bindStatusSnapshotUpsert(opts.db, opts.now, bodyJson, opts.payload.generated_at);
 

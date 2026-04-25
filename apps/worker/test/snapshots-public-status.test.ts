@@ -10,6 +10,7 @@ import {
   toSnapshotPayload,
   writeStatusSnapshot,
   prepareStatusSnapshotWrite,
+  didApplyStatusSnapshotWrite,
 } from '../src/snapshots/public-status';
 import {
   readStatusSnapshotJson as readStatusSnapshotJsonFastPath,
@@ -277,6 +278,181 @@ describe('snapshots/public-status', () => {
       280,
       now,
     ]);
+  });
+
+  it('prepares conditional status writes tied to the homepage artifact and lease', async () => {
+    let boundArgs: unknown[] | null = null;
+    const db = createFakeD1Database([
+      {
+        match: 'insert into public_snapshots',
+        run: (args) => {
+          boundArgs = args;
+          return { meta: { changes: 1 } };
+        },
+      },
+    ]);
+
+    const now = 300;
+    const payload = samplePayload(280);
+    const prepared = prepareStatusSnapshotWrite({
+      db,
+      now,
+      payload,
+      afterHomepage: {
+        key: 'homepage:artifact',
+        generatedAt: 280,
+        updatedAt: now,
+        lease: {
+          name: 'snapshot:homepage:refresh',
+          expiresAt: now + 55,
+        },
+      },
+    });
+    await prepared.statement.run();
+
+    expect(boundArgs).toEqual([
+      'status',
+      280,
+      JSON.stringify(payload),
+      now,
+      now + 60,
+      'homepage:artifact',
+      280,
+      now,
+      'snapshot:homepage:refresh',
+      now + 55,
+    ]);
+  });
+
+  it('reports conditional status writes as skipped when homepage or lease guards do not match', async () => {
+    const rows = new Map<string, { generated_at: number; updated_at: number; body_json: string }>([
+      [
+        'homepage:artifact',
+        {
+          generated_at: 280,
+          updated_at: 300,
+          body_json: '{}',
+        },
+      ],
+    ]);
+    const locks = new Map<string, number>([['snapshot:homepage:refresh', 355]]);
+    const db = createFakeD1Database([
+      {
+        match: 'insert into public_snapshots',
+        run: (args) => {
+          const [
+            key,
+            generatedAt,
+            bodyJson,
+            updatedAt,
+            futureCutoff,
+            homepageKey,
+            homepageGeneratedAt,
+            homepageUpdatedAt,
+            leaseName,
+            leaseExpiresAt,
+          ] = args as [
+            string,
+            number,
+            string,
+            number,
+            number,
+            string,
+            number,
+            number,
+            string | undefined,
+            number | undefined,
+          ];
+          const homepage = rows.get(homepageKey);
+          if (
+            !homepage ||
+            homepage.generated_at !== homepageGeneratedAt ||
+            homepage.updated_at !== homepageUpdatedAt ||
+            (leaseName !== undefined && locks.get(leaseName) !== leaseExpiresAt)
+          ) {
+            return { meta: { changes: 0 } };
+          }
+
+          const existing = rows.get(key);
+          if (!existing || generatedAt >= existing.generated_at || existing.generated_at > futureCutoff) {
+            rows.set(key, { generated_at: generatedAt, updated_at: updatedAt, body_json: bodyJson });
+            return { meta: { changes: 1 } };
+          }
+          return { meta: { changes: 0 } };
+        },
+      },
+    ]);
+
+    const now = 300;
+    const payload = samplePayload(280);
+    const matching = prepareStatusSnapshotWrite({
+      db,
+      now,
+      payload,
+      afterHomepage: {
+        key: 'homepage:artifact',
+        generatedAt: 280,
+        updatedAt: now,
+        lease: { name: 'snapshot:homepage:refresh', expiresAt: 355 },
+      },
+    });
+    const matchingResult = await matching.statement.run();
+
+    expect(didApplyStatusSnapshotWrite(matchingResult)).toBe(true);
+    expect(rows.get('status')).toEqual({
+      generated_at: 280,
+      updated_at: now,
+      body_json: JSON.stringify(payload),
+    });
+
+    rows.delete('status');
+    const mismatchedHomepage = prepareStatusSnapshotWrite({
+      db,
+      now,
+      payload,
+      afterHomepage: {
+        key: 'homepage:artifact',
+        generatedAt: 281,
+        updatedAt: now,
+        lease: { name: 'snapshot:homepage:refresh', expiresAt: 355 },
+      },
+    });
+    const mismatchedHomepageResult = await mismatchedHomepage.statement.run();
+
+    expect(didApplyStatusSnapshotWrite(mismatchedHomepageResult)).toBe(false);
+    expect(rows.has('status')).toBe(false);
+
+    const mismatchedUpdatedAt = prepareStatusSnapshotWrite({
+      db,
+      now,
+      payload,
+      afterHomepage: {
+        key: 'homepage:artifact',
+        generatedAt: 280,
+        updatedAt: now + 1,
+        lease: { name: 'snapshot:homepage:refresh', expiresAt: 355 },
+      },
+    });
+    const mismatchedUpdatedAtResult = await mismatchedUpdatedAt.statement.run();
+
+    expect(didApplyStatusSnapshotWrite(mismatchedUpdatedAtResult)).toBe(false);
+    expect(rows.has('status')).toBe(false);
+
+    const mismatchedLease = prepareStatusSnapshotWrite({
+      db,
+      now,
+      payload,
+      afterHomepage: {
+        key: 'homepage:artifact',
+        generatedAt: 280,
+        updatedAt: now,
+        lease: { name: 'snapshot:homepage:refresh', expiresAt: 356 },
+      },
+    });
+    const mismatchedLeaseResult = await mismatchedLease.statement.run();
+
+    expect(didApplyStatusSnapshotWrite(mismatchedLeaseResult)).toBe(false);
+    expect(rows.has('status')).toBe(false);
   });
 
   it('does not let an older status snapshot overwrite a newer one', async () => {
