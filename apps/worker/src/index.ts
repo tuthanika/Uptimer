@@ -456,36 +456,6 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
     return new Response('Payload Too Large', { status: 413 });
   }
 
-  let runtimeUpdates: MonitorRuntimeUpdate[] | undefined;
-  const scheduledRefreshRequest = isScheduledRefreshRequest(request);
-  const contentType = request.headers.get('Content-Type') ?? '';
-
-  if (contentType.includes('application/json')) {
-    const rawBody = await request.json().catch(() => null);
-    const parsedBody = scheduledRefreshRequest
-      ? parseInternalRefreshRuntimeUpdates(rawBody)
-      : (() => {
-          const parsed = internalRefreshJsonBodySchema.safeParse(rawBody);
-          if (!parsed.success) {
-            return null;
-          }
-
-          const runtime_updates = parsed.data.runtime_updates;
-          if (runtime_updates === undefined) {
-            return {};
-          }
-
-          const parsedRuntimeUpdates = parseMonitorRuntimeUpdates(runtime_updates);
-          return parsedRuntimeUpdates ? { runtime_updates: parsedRuntimeUpdates } : null;
-        })();
-    if (!parsedBody) {
-      return new Response('Forbidden', { status: 403 });
-    }
-
-    runtimeUpdates = parsedBody.runtime_updates;
-  }
-
-  const now = Math.floor(Date.now() / 1000);
   let traceMod: typeof import('./observability/trace') | null = null;
   let trace: Trace | null = null;
   if (normalizeTruthyHeader(request.headers.get('X-Uptimer-Trace'))) {
@@ -497,19 +467,89 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       }),
     );
   }
+
+  let runtimeUpdates: MonitorRuntimeUpdate[] | undefined;
+  const scheduledRefreshRequest = isScheduledRefreshRequest(request);
+  const contentType = request.headers.get('Content-Type') ?? '';
+
   if (trace?.enabled) {
     trace.setLabel('route', 'internal/homepage-refresh');
+    trace.setLabel('request_content_length', request.headers.get('Content-Length') ?? 'unknown');
+    trace.setLabel('internal_format', wantsCompactInternalFormat(request) ? 'compact-v1' : 'default');
+  }
+
+  if (contentType.includes('application/json')) {
+    const rawBody = trace
+      ? await trace.timeAsync('homepage_refresh_body_json_read', async () =>
+          await request.json().catch(() => null),
+        )
+      : await request.json().catch(() => null);
+    const parsedBody = trace
+      ? trace.time('homepage_refresh_body_parse_validate', () =>
+          scheduledRefreshRequest
+            ? parseInternalRefreshRuntimeUpdates(rawBody)
+            : (() => {
+                const parsed = internalRefreshJsonBodySchema.safeParse(rawBody);
+                if (!parsed.success) {
+                  return null;
+                }
+
+                const runtime_updates = parsed.data.runtime_updates;
+                if (runtime_updates === undefined) {
+                  return {};
+                }
+
+                const parsedRuntimeUpdates = parseMonitorRuntimeUpdates(runtime_updates);
+                return parsedRuntimeUpdates ? { runtime_updates: parsedRuntimeUpdates } : null;
+              })(),
+        )
+      : scheduledRefreshRequest
+        ? parseInternalRefreshRuntimeUpdates(rawBody)
+        : (() => {
+            const parsed = internalRefreshJsonBodySchema.safeParse(rawBody);
+            if (!parsed.success) {
+              return null;
+            }
+
+            const runtime_updates = parsed.data.runtime_updates;
+            if (runtime_updates === undefined) {
+              return {};
+            }
+
+            const parsedRuntimeUpdates = parseMonitorRuntimeUpdates(runtime_updates);
+            return parsedRuntimeUpdates ? { runtime_updates: parsedRuntimeUpdates } : null;
+          })();
+    if (!parsedBody) {
+      return new Response('Forbidden', { status: 403 });
+    }
+
+    runtimeUpdates = parsedBody.runtime_updates;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (trace?.enabled) {
     trace.setLabel('now', now);
     trace.setLabel('runtime_updates_count', runtimeUpdates?.length ?? 0);
   }
   const fastPathRuntimeUpdates =
     scheduledRefreshRequest && runtimeUpdates
-      ? await sanitizeScheduledRuntimeUpdatesForFastPath({
-          db: env.DB,
-          now,
-          updates: runtimeUpdates,
-          trace,
-        })
+      ? trace
+        ? await trace.timeAsync(
+            'homepage_refresh_sanitize_runtime_updates',
+            async () =>
+              await sanitizeScheduledRuntimeUpdatesForFastPath({
+                db: env.DB,
+                now,
+                updates: runtimeUpdates,
+                trace,
+              }),
+          )
+        : await sanitizeScheduledRuntimeUpdatesForFastPath({
+            db: env.DB,
+            now,
+            updates: runtimeUpdates,
+            trace,
+          })
       : (runtimeUpdates ?? []);
   if (trace?.enabled) {
     trace.setLabel('runtime_updates_fast_path_count', fastPathRuntimeUpdates.length);
@@ -804,34 +844,72 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       : await statusMod.tryComputePublicStatusPayloadFromScheduledRuntimeUpdates(statusRefreshArgs);
 
     homepageRefreshLease.assertHeld('writing homepage snapshot');
-    const preparedHomepageWrite = snapshotMod.prepareHomepageSnapshotWrite(
-      env.DB,
-      now,
-      payload,
-      trace ?? undefined,
-      baseSnapshot.seedDataSnapshot,
-      {
-        name: HOMEPAGE_REFRESH_LOCK_NAME,
-        expiresAt: homepageRefreshLease.getExpiresAt(),
-      },
-    );
-    const preparedStatusWrite = refreshedStatusPayload
-      ? statusSnapshotMod.prepareStatusSnapshotWrite({
-          db: env.DB,
-          now,
-          payload: refreshedStatusPayload,
-          ...(trace ? { trace } : {}),
-          afterHomepage: {
-            key: snapshotMod.getHomepageSnapshotArtifactKey(),
-            generatedAt: preparedHomepageWrite.generatedAt,
-            updatedAt: now,
-            lease: {
+    const activeHomepageRefreshLease = homepageRefreshLease;
+    const { preparedHomepageWrite, preparedStatusWrite } = trace
+      ? trace.time('snapshot_prepare_writes', () => {
+          const preparedHomepageWrite = snapshotMod.prepareHomepageSnapshotWrite(
+            env.DB,
+            now,
+            payload,
+            trace ?? undefined,
+            baseSnapshot.seedDataSnapshot,
+            {
               name: HOMEPAGE_REFRESH_LOCK_NAME,
-              expiresAt: homepageRefreshLease.getExpiresAt(),
+              expiresAt: activeHomepageRefreshLease.getExpiresAt(),
             },
-          },
+          );
+          const preparedStatusWrite = refreshedStatusPayload
+            ? statusSnapshotMod.prepareStatusSnapshotWrite({
+                db: env.DB,
+                now,
+                payload: refreshedStatusPayload,
+                ...(trace ? { trace } : {}),
+                afterHomepage: {
+                  key: snapshotMod.getHomepageSnapshotArtifactKey(),
+                  generatedAt: preparedHomepageWrite.generatedAt,
+                  updatedAt: now,
+                  lease: {
+                    name: HOMEPAGE_REFRESH_LOCK_NAME,
+                    expiresAt: activeHomepageRefreshLease.getExpiresAt(),
+                  },
+                },
+              })
+            : null;
+          return { preparedHomepageWrite, preparedStatusWrite };
         })
-      : null;
+      : (() => {
+          const preparedHomepageWrite = snapshotMod.prepareHomepageSnapshotWrite(
+            env.DB,
+            now,
+            payload,
+            undefined,
+            baseSnapshot.seedDataSnapshot,
+            {
+              name: HOMEPAGE_REFRESH_LOCK_NAME,
+              expiresAt: activeHomepageRefreshLease.getExpiresAt(),
+            },
+          );
+          const preparedStatusWrite = refreshedStatusPayload
+            ? statusSnapshotMod.prepareStatusSnapshotWrite({
+                db: env.DB,
+                now,
+                payload: refreshedStatusPayload,
+                afterHomepage: {
+                  key: snapshotMod.getHomepageSnapshotArtifactKey(),
+                  generatedAt: preparedHomepageWrite.generatedAt,
+                  updatedAt: now,
+                  lease: {
+                    name: HOMEPAGE_REFRESH_LOCK_NAME,
+                    expiresAt: activeHomepageRefreshLease.getExpiresAt(),
+                  },
+                },
+              })
+            : null;
+          return { preparedHomepageWrite, preparedStatusWrite };
+        })();
+    if (trace?.enabled) {
+      trace.setLabel('snapshot_write_count', preparedStatusWrite ? 2 : 1);
+    }
     const writeResults = trace
       ? await trace.timeAsync(
           preparedStatusWrite ? 'snapshot_writes_batch' : 'homepage_refresh_write',
@@ -844,12 +922,34 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
         ? await env.DB.batch([preparedHomepageWrite.statement, preparedStatusWrite.statement])
         : [await preparedHomepageWrite.statement.run()];
     homepageRefreshLease.assertHeld('finalizing snapshot writes');
-    const homepageWriteResult = writeResults[0];
-    if (!homepageWriteResult) {
-      throw new Error('homepage snapshot write returned no result');
-    }
-    const homepageSnapshotWritten = snapshotMod.didApplyHomepageSnapshotWrite(homepageWriteResult);
-    if (!homepageSnapshotWritten) {
+    const writeInspection = trace
+      ? trace.time('snapshot_write_result_inspect', () => {
+          const homepageWriteResult = writeResults[0];
+          if (!homepageWriteResult) {
+            throw new Error('homepage snapshot write returned no result');
+          }
+          const homepageSnapshotWritten =
+            snapshotMod.didApplyHomepageSnapshotWrite(homepageWriteResult);
+          const statusWriteResult = writeResults[1];
+          const statusSnapshotWritten = refreshedStatusPayload
+            ? statusSnapshotMod.didApplyStatusSnapshotWrite(statusWriteResult)
+            : false;
+          return { homepageSnapshotWritten, statusSnapshotWritten };
+        })
+      : (() => {
+          const homepageWriteResult = writeResults[0];
+          if (!homepageWriteResult) {
+            throw new Error('homepage snapshot write returned no result');
+          }
+          const homepageSnapshotWritten =
+            snapshotMod.didApplyHomepageSnapshotWrite(homepageWriteResult);
+          const statusWriteResult = writeResults[1];
+          const statusSnapshotWritten = refreshedStatusPayload
+            ? statusSnapshotMod.didApplyStatusSnapshotWrite(statusWriteResult)
+            : false;
+          return { homepageSnapshotWritten, statusSnapshotWritten };
+        })();
+    if (!writeInspection.homepageSnapshotWritten) {
       if (trace?.enabled) {
         trace.setLabel('skip', 'homepage_write_noop');
       }
@@ -861,11 +961,7 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
       );
     }
     preparedHomepageWrite.prime();
-    const statusWriteResult = writeResults[1];
-    if (
-      refreshedStatusPayload &&
-      statusSnapshotMod.didApplyStatusSnapshotWrite(statusWriteResult)
-    ) {
+    if (refreshedStatusPayload && writeInspection.statusSnapshotWritten) {
       preparedStatusWrite?.prime();
       trace?.setLabel('status_refresh', 'patched');
     } else if (refreshedStatusPayload) {

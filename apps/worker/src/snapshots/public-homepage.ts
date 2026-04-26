@@ -902,6 +902,11 @@ export function prepareHomepageSnapshotWrite(
   const renderBodyJson = withTraceSync(trace, 'homepage_write_stringify_artifact', () =>
     JSON.stringify(render),
   );
+  if (trace?.enabled) {
+    trace.setLabel('homepage_payload_monitors', payload.monitors.length);
+    trace.setLabel('homepage_payload_bytes', payloadBodyJson.length);
+    trace.setLabel('homepage_artifact_bytes', renderBodyJson.length);
+  }
 
   return {
     statement: homepageSnapshotUpsertStatement(

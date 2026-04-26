@@ -331,6 +331,10 @@ export function prepareStatusSnapshotWrite(opts: {
   const bodyJson = withTraceSync(opts.trace, 'status_write_stringify', () =>
     JSON.stringify(opts.payload),
   );
+  if (opts.trace?.enabled) {
+    opts.trace.setLabel('status_payload_monitors', opts.payload.monitors.length);
+    opts.trace.setLabel('status_payload_bytes', bodyJson.length);
+  }
   const statement = opts.afterHomepage
     ? bindStatusSnapshotAfterHomepageUpsert({
         db: opts.db,
