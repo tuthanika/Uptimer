@@ -19,6 +19,7 @@ export type InternalHomepageRefreshCoreResult = {
   ok: boolean;
   refreshed: boolean;
   error?: boolean;
+  baseSnapshotSource?: 'memory_cache' | 'd1';
   skip?:
     | 'fresh'
     | 'lease'
@@ -300,6 +301,7 @@ export async function runInternalHomepageRefreshCore({
   let releaseHomepageRefreshLease:
     | ((db: D1Database, name: string, expiresAt: number) => Promise<void>)
     | null = null;
+  let baseSnapshotSource: InternalHomepageRefreshCoreResult['baseSnapshotSource'];
 
   try {
     const {
@@ -377,8 +379,9 @@ export async function runInternalHomepageRefreshCore({
             async () => await readHomepageRefreshBaseSnapshot(env.DB, now),
           )
         : await readHomepageRefreshBaseSnapshot(env.DB, now);
+    baseSnapshotSource = cachedBaseSnapshot ? 'memory_cache' : 'd1';
     if (trace?.enabled) {
-      trace.setLabel('base_snapshot', cachedBaseSnapshot ? 'memory_cache' : 'd1');
+      trace.setLabel('base_snapshot', baseSnapshotSource);
       trace.setLabel('base_seed_data', baseSnapshot.seedDataSnapshot ? '1' : '0');
       trace.setLabel(
         'base_age_s',
@@ -393,7 +396,10 @@ export async function runInternalHomepageRefreshCore({
       isSameMinuteTimestamp(baseSnapshot.generatedAt, now)
     ) {
       trace?.setLabel('skip', 'fresh_after_lease');
-      return toInternalHomepageRefreshCoreResult(true, false, { skip: 'fresh_after_lease' });
+      return toInternalHomepageRefreshCoreResult(true, false, {
+        skip: 'fresh_after_lease',
+        baseSnapshotSource,
+      });
     }
 
     const [homepageMod, snapshotMod, statusMod, statusSnapshotMod, statusSnapshotReadMod] =
@@ -648,6 +654,7 @@ export async function runInternalHomepageRefreshCore({
       trace?.setLabel('skip', 'homepage_write_noop');
       return toInternalHomepageRefreshCoreResult(true, false, {
         skip: 'homepage_write_noop',
+        baseSnapshotSource,
       });
     }
 
@@ -661,16 +668,22 @@ export async function runInternalHomepageRefreshCore({
       trace?.setLabel('status_refresh', 'skipped');
     }
 
-    return toInternalHomepageRefreshCoreResult(true, true);
+    return toInternalHomepageRefreshCoreResult(true, true, { baseSnapshotSource });
   } catch (err) {
     if (err instanceof LeaseLostError) {
       console.warn(err.message);
       trace?.setLabel('skip', 'lease_lost');
-      return toInternalHomepageRefreshCoreResult(true, false, { skip: 'lease_lost' });
+      return toInternalHomepageRefreshCoreResult(true, false, {
+        skip: 'lease_lost',
+        ...(baseSnapshotSource ? { baseSnapshotSource } : {}),
+      });
     }
 
     console.warn('internal refresh: homepage failed', err);
-    return toInternalHomepageRefreshCoreResult(false, false, { error: true });
+    return toInternalHomepageRefreshCoreResult(false, false, {
+      error: true,
+      ...(baseSnapshotSource ? { baseSnapshotSource } : {}),
+    });
   } finally {
     if (homepageRefreshLease) {
       await homepageRefreshLease.stop().catch((err) => {
