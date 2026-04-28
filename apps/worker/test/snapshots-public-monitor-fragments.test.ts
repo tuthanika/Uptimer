@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  assemblePublicHomepagePayloadFromFragments,
+  assemblePublicStatusPayloadFromFragments,
   buildHomepageEnvelopeFragmentWrite,
   buildHomepageMonitorFragmentWrites,
   buildMonitorRuntimeUpdateFragmentWrites,
@@ -9,10 +11,18 @@ import {
   HOMEPAGE_ENVELOPE_FRAGMENT_KEY,
   HOMEPAGE_MONITOR_FRAGMENTS_KEY,
   MONITOR_RUNTIME_UPDATE_FRAGMENTS_KEY,
+  parseHomepageEnvelopeFragmentRows,
+  parseHomepageMonitorFragmentRows,
   parseMonitorRuntimeUpdateFragmentRows,
   parsePublicMonitorFragmentKey,
+  parseStatusEnvelopeFragmentRows,
+  parseStatusMonitorFragmentRows,
   PUBLIC_SNAPSHOT_ENVELOPE_FRAGMENT_KEY,
+  readHomepageSnapshotBodyJsonFromFragments,
+  readHomepageSnapshotFragments,
   readMonitorRuntimeUpdateFragments,
+  readStatusSnapshotBodyJsonFromFragments,
+  readStatusSnapshotFragments,
   STATUS_ENVELOPE_FRAGMENT_KEY,
   STATUS_MONITOR_FRAGMENTS_KEY,
   toPublicMonitorFragmentKey,
@@ -213,16 +223,187 @@ describe('snapshots/public-monitor-fragments', () => {
 
     const statusEnvelope = JSON.parse(statusWrite.bodyJson);
     const homepageEnvelope = JSON.parse(homepageWrite.bodyJson);
-    expect(statusEnvelope).toMatchObject({ site_title: 'Uptimer', summary: { up: 2 } });
+    expect(statusEnvelope).toMatchObject({
+      site_title: 'Uptimer',
+      summary: { up: 2 },
+      monitor_ids: [1, 2],
+    });
     expect(homepageEnvelope).toMatchObject({
       site_title: 'Uptimer',
       bootstrap_mode: 'full',
       summary: { up: 2 },
+      monitor_ids: [1, 2],
     });
     expect(statusEnvelope).not.toHaveProperty('monitors');
     expect(homepageEnvelope).not.toHaveProperty('monitors');
     expect(statusWrite.bodyJson).not.toContain('heartbeats');
     expect(homepageWrite.bodyJson).not.toContain('heartbeat_strip');
+  });
+
+  it('reads and assembles status/homepage snapshots from envelope and monitor fragments', async () => {
+    const statusEnvelopeWrite = buildStatusEnvelopeFragmentWrite(statusPayload(), 1_700_000_005);
+    const statusMonitorWrites = buildStatusMonitorFragmentWrites(statusPayload(), 1_700_000_005);
+    const homepageEnvelopeWrite = buildHomepageEnvelopeFragmentWrite(homepagePayload(), 1_700_000_005);
+    const homepageMonitorWrites = buildHomepageMonitorFragmentWrites(homepagePayload(), 1_700_000_005);
+
+    const statusEnvelope = parseStatusEnvelopeFragmentRows([
+      {
+        fragment_key: statusEnvelopeWrite.fragmentKey,
+        generated_at: statusEnvelopeWrite.generatedAt,
+        body_json: statusEnvelopeWrite.bodyJson,
+        updated_at: statusEnvelopeWrite.updatedAt,
+      },
+    ]);
+    const statusMonitors = parseStatusMonitorFragmentRows(
+      statusMonitorWrites.map((write) => ({
+        fragment_key: write.fragmentKey,
+        generated_at: write.generatedAt,
+        body_json: write.bodyJson,
+        updated_at: write.updatedAt,
+      })),
+    );
+    const homepageEnvelope = parseHomepageEnvelopeFragmentRows([
+      {
+        fragment_key: homepageEnvelopeWrite.fragmentKey,
+        generated_at: homepageEnvelopeWrite.generatedAt,
+        body_json: homepageEnvelopeWrite.bodyJson,
+        updated_at: homepageEnvelopeWrite.updatedAt,
+      },
+    ]);
+    const homepageMonitors = parseHomepageMonitorFragmentRows(
+      homepageMonitorWrites.map((write) => ({
+        fragment_key: write.fragmentKey,
+        generated_at: write.generatedAt,
+        body_json: write.bodyJson,
+        updated_at: write.updatedAt,
+      })),
+    );
+
+    expect(statusEnvelope?.generatedAt).toBe(1_700_000_000);
+    expect(statusMonitors.invalidCount).toBe(0);
+    expect(homepageEnvelope?.generatedAt).toBe(1_700_000_000);
+    expect(homepageMonitors.invalidCount).toBe(0);
+    expect(
+      assemblePublicStatusPayloadFromFragments(statusEnvelope!.data, statusMonitors.data),
+    ).toEqual(statusPayload());
+    expect(
+      assemblePublicHomepagePayloadFromFragments(homepageEnvelope!.data, homepageMonitors.data),
+    ).toEqual(homepagePayload());
+
+    const db = createFakeD1Database([
+      {
+        match: 'from public_snapshot_fragments',
+        all: (args) => {
+          if (args[0] === STATUS_ENVELOPE_FRAGMENT_KEY) {
+            return [{
+              fragment_key: statusEnvelopeWrite.fragmentKey,
+              generated_at: statusEnvelopeWrite.generatedAt,
+              body_json: statusEnvelopeWrite.bodyJson,
+              updated_at: statusEnvelopeWrite.updatedAt,
+            }];
+          }
+          if (args[0] === STATUS_MONITOR_FRAGMENTS_KEY) {
+            return statusMonitorWrites.map((write) => ({
+              fragment_key: write.fragmentKey,
+              generated_at: write.generatedAt,
+              body_json: write.bodyJson,
+              updated_at: write.updatedAt,
+            }));
+          }
+          if (args[0] === HOMEPAGE_ENVELOPE_FRAGMENT_KEY) {
+            return [{
+              fragment_key: homepageEnvelopeWrite.fragmentKey,
+              generated_at: homepageEnvelopeWrite.generatedAt,
+              body_json: homepageEnvelopeWrite.bodyJson,
+              updated_at: homepageEnvelopeWrite.updatedAt,
+            }];
+          }
+          if (args[0] === HOMEPAGE_MONITOR_FRAGMENTS_KEY) {
+            return homepageMonitorWrites.map((write) => ({
+              fragment_key: write.fragmentKey,
+              generated_at: write.generatedAt,
+              body_json: write.bodyJson,
+              updated_at: write.updatedAt,
+            }));
+          }
+          return [];
+        },
+      },
+    ]);
+
+    await expect(readStatusSnapshotFragments(db)).resolves.toMatchObject({
+      envelope: { generatedAt: 1_700_000_000 },
+      monitors: { data: [{ id: 1 }, { id: 2 }], invalidCount: 0 },
+    });
+    await expect(readHomepageSnapshotFragments(db)).resolves.toMatchObject({
+      envelope: { generatedAt: 1_700_000_000 },
+      monitors: { data: [{ id: 1 }, { id: 2 }], invalidCount: 0 },
+    });
+  });
+
+  it('assembles public body JSON from envelope and raw monitor fragments', async () => {
+    const statusEnvelopeWrite = buildStatusEnvelopeFragmentWrite(statusPayload(), 1_700_000_005);
+    const statusMonitorWrites = buildStatusMonitorFragmentWrites(statusPayload(), 1_700_000_005).reverse();
+    const homepageEnvelopeWrite = buildHomepageEnvelopeFragmentWrite(homepagePayload(), 1_700_000_005);
+    const homepageMonitorWrites = buildHomepageMonitorFragmentWrites(homepagePayload(), 1_700_000_005).reverse();
+    const db = createFakeD1Database([
+      {
+        match: 'from public_snapshot_fragments',
+        all: (args) => {
+          if (args[0] === STATUS_ENVELOPE_FRAGMENT_KEY) {
+            return [{
+              fragment_key: statusEnvelopeWrite.fragmentKey,
+              generated_at: statusEnvelopeWrite.generatedAt,
+              body_json: statusEnvelopeWrite.bodyJson,
+              updated_at: statusEnvelopeWrite.updatedAt,
+            }];
+          }
+          if (args[0] === STATUS_MONITOR_FRAGMENTS_KEY) {
+            return statusMonitorWrites.map((write) => ({
+              fragment_key: write.fragmentKey,
+              generated_at: write.generatedAt,
+              body_json: write.bodyJson,
+              updated_at: write.updatedAt,
+            }));
+          }
+          if (args[0] === HOMEPAGE_ENVELOPE_FRAGMENT_KEY) {
+            return [{
+              fragment_key: homepageEnvelopeWrite.fragmentKey,
+              generated_at: homepageEnvelopeWrite.generatedAt,
+              body_json: homepageEnvelopeWrite.bodyJson,
+              updated_at: homepageEnvelopeWrite.updatedAt,
+            }];
+          }
+          if (args[0] === HOMEPAGE_MONITOR_FRAGMENTS_KEY) {
+            return homepageMonitorWrites.map((write) => ({
+              fragment_key: write.fragmentKey,
+              generated_at: write.generatedAt,
+              body_json: write.bodyJson,
+              updated_at: write.updatedAt,
+            }));
+          }
+          return [];
+        },
+      },
+    ]);
+
+    const statusBody = await readStatusSnapshotBodyJsonFromFragments(db);
+    const homepageBody = await readHomepageSnapshotBodyJsonFromFragments(db);
+
+    expect(statusBody).toMatchObject({
+      generatedAt: 1_700_000_000,
+      monitorCount: 2,
+      invalidCount: 0,
+      staleCount: 0,
+    });
+    expect(homepageBody).toMatchObject({
+      generatedAt: 1_700_000_000,
+      monitorCount: 2,
+      invalidCount: 0,
+      staleCount: 0,
+    });
+    expect(JSON.parse(statusBody!.bodyJson)).toEqual(statusPayload());
+    expect(JSON.parse(homepageBody!.bodyJson)).toEqual(homepagePayload());
   });
 
   it('serializes compact monitor runtime update fragments with latest update wins', () => {

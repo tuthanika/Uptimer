@@ -362,6 +362,146 @@ describe('scheduler/scheduled regression', () => {
     expect(refreshPublicHomepageSnapshotIfNeeded).not.toHaveBeenCalled();
   });
 
+  it('self-invokes sharded seed and assembler work after homepage refresh when enabled', async () => {
+    const env = createEnv({ dueRows: [] }) as unknown as Env;
+    env.ADMIN_TOKEN = 'test-admin-token';
+    env.UPTIMER_PUBLIC_SHARDED_FRAGMENT_SEED = '1';
+    env.UPTIMER_SCHEDULED_SHARDED_FRAGMENT_SEED = '1';
+    env.UPTIMER_PUBLIC_SHARDED_ASSEMBLER = '1';
+    env.UPTIMER_SCHEDULED_SHARDED_ASSEMBLER = '1';
+    env.UPTIMER_SHARDED_ASSEMBLER_MODE = 'json';
+    env.UPTIMER_SHARDED_FRAGMENT_SEED_BATCH_SIZE = '2';
+    const seedBodies: unknown[] = [];
+    const assembleBodies: unknown[] = [];
+    const selfFetch = vi.fn(async (request: Request) => {
+      const path = new URL(request.url).pathname;
+      if (path === '/api/v1/internal/refresh/homepage') {
+        return new Response(JSON.stringify({ ok: true, refreshed: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        });
+      }
+      if (path === '/api/v1/internal/seed/sharded-public-snapshot') {
+        const body = await request.json();
+        seedBodies.push(body);
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            seeded: true,
+            kind: (body as { kind: string }).kind,
+            part: (body as { part: string }).part,
+            monitor_count: 3,
+            write_count: (body as { part: string }).part === 'envelope' ? 1 : 2,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json; charset=utf-8' } },
+        );
+      }
+      if (path === '/api/v1/internal/assemble/sharded-public-snapshot') {
+        const body = await request.json();
+        assembleBodies.push(body);
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            assembled: true,
+            kind: (body as { kind: string }).kind,
+            monitor_count: 3,
+            invalid_count: 0,
+            stale_count: 0,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json; charset=utf-8' } },
+        );
+      }
+      throw new Error(`unexpected self fetch: ${path}`);
+    });
+    env.SELF = { fetch: selfFetch } as unknown as Fetcher;
+    const waitUntil = vi.fn();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+
+    expect(waitUntil).toHaveBeenCalledTimes(1);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+    expect(selfFetch).toHaveBeenCalledTimes(9);
+    expect((selfFetch.mock.calls[0]?.[0] as Request).headers.get('Authorization')).toBe(
+      'Bearer test-admin-token',
+    );
+    expect(selfFetch.mock.calls.map((call) => new URL((call[0] as Request).url).pathname)).toEqual([
+      '/api/v1/internal/refresh/homepage',
+      '/api/v1/internal/seed/sharded-public-snapshot',
+      '/api/v1/internal/seed/sharded-public-snapshot',
+      '/api/v1/internal/seed/sharded-public-snapshot',
+      '/api/v1/internal/seed/sharded-public-snapshot',
+      '/api/v1/internal/seed/sharded-public-snapshot',
+      '/api/v1/internal/seed/sharded-public-snapshot',
+      '/api/v1/internal/assemble/sharded-public-snapshot',
+      '/api/v1/internal/assemble/sharded-public-snapshot',
+    ]);
+    expect(seedBodies).toEqual([
+      { kind: 'homepage', part: 'envelope', monitor_offset: 0, monitor_limit: 2 },
+      { kind: 'homepage', part: 'monitors', monitor_offset: 0, monitor_limit: 2 },
+      { kind: 'homepage', part: 'monitors', monitor_offset: 2, monitor_limit: 2 },
+      { kind: 'status', part: 'envelope', monitor_offset: 0, monitor_limit: 2 },
+      { kind: 'status', part: 'monitors', monitor_offset: 0, monitor_limit: 2 },
+      { kind: 'status', part: 'monitors', monitor_offset: 2, monitor_limit: 2 },
+    ]);
+    expect(assembleBodies).toEqual([
+      { kind: 'homepage', assembly: 'json' },
+      { kind: 'status', assembly: 'json' },
+    ]);
+    logSpy.mockRestore();
+  });
+
+  it('skips monolithic homepage refresh in the gated sharded scheduled mode', async () => {
+    const env = createEnv({ dueRows: [] }) as unknown as Env;
+    env.ADMIN_TOKEN = 'test-admin-token';
+    env.UPTIMER_PUBLIC_SHARDED_FRAGMENT_SEED = '1';
+    env.UPTIMER_SCHEDULED_SHARDED_FRAGMENT_SEED = '1';
+    env.UPTIMER_PUBLIC_SHARDED_ASSEMBLER = '1';
+    env.UPTIMER_SCHEDULED_SHARDED_ASSEMBLER = '1';
+    env.UPTIMER_SCHEDULED_SHARDED_SKIP_HOMEPAGE_REFRESH = '1';
+    env.UPTIMER_SCHEDULED_SHARDED_CONTINUATION = '1';
+    env.UPTIMER_SHARDED_ASSEMBLER_MODE = 'json';
+    env.UPTIMER_SHARDED_FRAGMENT_SEED_BATCH_SIZE = '2';
+    const selfFetch = vi.fn(async (request: Request) => {
+      const path = new URL(request.url).pathname;
+      if (path === '/api/v1/internal/refresh/homepage') {
+        throw new Error('monolithic homepage refresh should be skipped');
+      }
+      if (path === '/api/v1/internal/continue/sharded-public-snapshot') {
+        return new Response(JSON.stringify({ ok: true, continued: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        });
+      }
+      throw new Error(`unexpected self fetch: ${path}`);
+    });
+    env.SELF = { fetch: selfFetch } as unknown as Fetcher;
+    const waitUntil = vi.fn();
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+
+    expect(waitUntil).toHaveBeenCalledTimes(1);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+    expect(selfFetch).toHaveBeenCalledTimes(1);
+    expect(new URL((selfFetch.mock.calls[0]?.[0] as Request).url).pathname).toBe(
+      '/api/v1/internal/continue/sharded-public-snapshot',
+    );
+    await expect((selfFetch.mock.calls[0]?.[0] as Request).json()).resolves.toEqual({
+      step: 'seed',
+      kind: 'homepage',
+      part: 'envelope',
+      monitor_offset: 0,
+      monitor_limit: 2,
+    });
+    expect(logSpy).toHaveBeenCalledWith(
+      'scheduled: homepage_refresh_skip reason=sharded_public_snapshots runtime_updates=0',
+    );
+    logSpy.mockRestore();
+  });
+
   it('uses runtime fragments as the scheduled post-check pipeline when enabled', async () => {
     const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
     const dueRows = Array.from({ length: 7 }, (_, index) => ({
