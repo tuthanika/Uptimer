@@ -190,6 +190,15 @@ function shouldAssembleScheduledShardedSnapshots(env: Env): boolean {
   );
 }
 
+function shouldSkipScheduledHomepageRefreshForShardedSnapshots(env: Env): boolean {
+  const rawEnv = env as unknown as Record<string, unknown>;
+  return (
+    Boolean(env.SELF) &&
+    isTruthyEnvFlag(rawEnv.UPTIMER_SCHEDULED_SHARDED_SKIP_HOMEPAGE_REFRESH) &&
+    (shouldSeedScheduledShardedFragments(env) || shouldAssembleScheduledShardedSnapshots(env))
+  );
+}
+
 function readBoundedPositiveIntegerEnv(
   env: Env,
   key: string,
@@ -1604,6 +1613,13 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
     runtimeUpdates?: MonitorRuntimeUpdate[],
     runtimeSnapshotBaseline?: PublicMonitorRuntimeSnapshot,
   ) => {
+    if (shouldSkipScheduledHomepageRefreshForShardedSnapshots(env)) {
+      console.log(
+        `scheduled: homepage_refresh_skip reason=sharded_public_snapshots runtime_updates=${runtimeUpdates?.length ?? 0}`,
+      );
+      return queueShardedPublicSnapshotWork();
+    }
+
     let refreshPromise: Promise<void>;
     if (shouldRefreshHomepageDirect(env)) {
       refreshPromise = runInternalHomepageRefreshCore({
