@@ -1,6 +1,5 @@
 import type { Context } from 'hono';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
-import { ZodError } from 'zod';
 
 export type ErrorResponse = {
   error: {
@@ -29,6 +28,16 @@ function jsonError(
   return c.json({ error: { code, message } } satisfies ErrorResponse, status);
 }
 
+function isZodErrorLike(err: unknown): err is { message: string } {
+  if (!err || typeof err !== 'object') return false;
+  const record = err as Record<string, unknown>;
+  return (
+    record['name'] === 'ZodError' &&
+    typeof record['message'] === 'string' &&
+    Array.isArray(record['issues'])
+  );
+}
+
 export function handleNotFound(c: Context): Response {
   return jsonError(c, 404, 'NOT_FOUND', 'Not Found');
 }
@@ -38,7 +47,7 @@ export function handleError(err: unknown, c: Context): Response {
     return jsonError(c, err.status, err.code, err.message);
   }
 
-  if (err instanceof ZodError) {
+  if (isZodErrorLike(err)) {
     return jsonError(c, 400, 'INVALID_ARGUMENT', err.message);
   }
 

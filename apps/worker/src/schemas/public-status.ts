@@ -63,6 +63,23 @@ const heartbeatSchema = z.object({
   latency_ms: z.number().int().nonnegative().nullable(),
 });
 
+const storedPublicMonitorSchema = z.object({
+  id: z.number().int().positive(),
+  name: z.string(),
+  type: z.enum(['http', 'tcp']),
+  group_name: z.string().min(1).nullable(),
+  group_sort_order: z.number().int(),
+  sort_order: z.number().int(),
+  uptime_rating_level: uptimeRatingLevelSchema,
+  status: monitorStatusSchema,
+  is_stale: z.boolean(),
+  last_checked_at: z.number().int().nonnegative().nullable(),
+  last_latency_ms: z.number().int().nonnegative().nullable(),
+  heartbeats: z.array(heartbeatSchema),
+  uptime_30d: uptimeSummarySchema.nullable(),
+  uptime_days: z.array(uptimeDaySchema),
+});
+
 const publicMonitorSchema = z.object({
   id: z.number().int().positive(),
   name: z.string(),
@@ -138,6 +155,30 @@ export const publicStatusResponseSchema = z.object({
     unknown: z.number().int().nonnegative(),
   }),
   monitors: z.array(publicMonitorSchema),
+  active_incidents: z.array(incidentSchema),
+  maintenance_windows: z.object({
+    active: z.array(maintenanceWindowSchema),
+    upcoming: z.array(maintenanceWindowSchema),
+  }),
+});
+
+export const storedPublicStatusResponseSchema = z.object({
+  generated_at: z.number().int().nonnegative(),
+  site_title: z.string(),
+  site_description: z.string(),
+  site_locale: z.enum(['auto', 'en', 'zh-CN', 'zh-TW', 'ja', 'es']),
+  site_timezone: z.string(),
+  uptime_rating_level: uptimeRatingLevelSchema,
+  overall_status: monitorStatusSchema,
+  banner: bannerSchema,
+  summary: z.object({
+    up: z.number().int().nonnegative(),
+    down: z.number().int().nonnegative(),
+    maintenance: z.number().int().nonnegative(),
+    paused: z.number().int().nonnegative(),
+    unknown: z.number().int().nonnegative(),
+  }),
+  monitors: z.array(storedPublicMonitorSchema),
   active_incidents: z.array(incidentSchema),
   maintenance_windows: z.object({
     active: z.array(maintenanceWindowSchema),

@@ -298,6 +298,90 @@ describe('public/status payload regression', () => {
     expect(today?.uptime_pct).toBeCloseTo(100, 6);
   });
 
+  it('does not hide uptime metrics when all monitors are created after UTC day start', async () => {
+    const dayStart = 1_728_000_000;
+    const now = dayStart + 36_600; // 10h 10m into current UTC day
+    const createdAt = now - 600; // created 10m ago
+
+    const handlers: FakeD1QueryHandler[] = [
+      {
+        match: 'from monitors m',
+        all: () => [
+          {
+            id: 12,
+            name: 'Fresh Monitor',
+            type: 'http',
+            group_name: null,
+            group_sort_order: 0,
+            sort_order: 0,
+            interval_sec: 60,
+            created_at: createdAt,
+            state_status: 'up',
+            last_checked_at: now - 30,
+            last_latency_ms: 70,
+          },
+        ],
+      },
+      {
+        match: 'select distinct mwm.monitor_id',
+        all: () => [],
+      },
+      {
+        match: 'select value from settings where key = ?1',
+        first: (args) => (args[0] === 'uptime_rating_level' ? { value: '3' } : null),
+      },
+      {
+        match: 'row_number() over',
+        all: () => [{ monitor_id: 12, checked_at: now - 120, status: 'up', latency_ms: 70 }],
+      },
+      {
+        match: 'from monitor_daily_rollups',
+        all: () => [],
+      },
+      {
+        match: 'select monitor_id, started_at, ended_at',
+        all: () => [],
+      },
+      {
+        match: 'select monitor_id, checked_at, status from check_results',
+        all: () => [{ monitor_id: 12, checked_at: now - 120, status: 'up' }],
+      },
+      {
+        match: 'from incidents',
+        all: () => [],
+      },
+      {
+        match: 'from maintenance_windows where starts_at <= ?1 and ends_at > ?1',
+        all: () => [],
+      },
+      {
+        match: 'from maintenance_windows where starts_at > ?1',
+        all: () => [],
+      },
+      {
+        match: 'select key, value from settings',
+        all: () => [{ key: 'site_timezone', value: 'UTC' }],
+      },
+    ];
+
+    const payload = await computePublicStatusPayload(createFakeD1Database(handlers), now);
+    expect(payload.monitors).toHaveLength(1);
+
+    const monitor = payload.monitors[0];
+    expect(monitor?.uptime_30d).not.toBeNull();
+
+    const today = monitor?.uptime_days.at(-1);
+    expect(today).toBeDefined();
+    expect(today).toMatchObject({
+      day_start_at: dayStart,
+      total_sec: 120,
+      downtime_sec: 0,
+      unknown_sec: 0,
+      uptime_sec: 120,
+    });
+    expect(today?.uptime_pct).toBeCloseTo(100, 6);
+  });
+
   it('does not count unknown time before the first probe when monitor has never been checked', async () => {
     const dayStart = 1_728_000_000;
     const now = dayStart + 36_600; // 10h 10m into current UTC day

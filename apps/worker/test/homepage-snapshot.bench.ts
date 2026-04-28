@@ -374,7 +374,12 @@ async function runOneRootMiss(scenario: RootMissScenario): Promise<RootMissSampl
       elapsedMs,
       artifactKB: Number((JSON.stringify(artifact).length / 1024).toFixed(1)),
       preloadKB: Number((artifact.preload_html.length / 1024).toFixed(1)),
-      snapshotKB: Number((JSON.stringify(artifact.snapshot).length / 1024).toFixed(1)),
+      snapshotKB: Number(
+        (
+          (('snapshot_json' in artifact ? artifact.snapshot_json : JSON.stringify(artifact.snapshot))
+            .length / 1024)
+        ).toFixed(1),
+      ),
     };
   } finally {
     globalThis.fetch = originalFetch;

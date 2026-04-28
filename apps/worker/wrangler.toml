@@ -1,9 +1,17 @@
 name = "uptimer"
 main = "src/index.ts"
 compatibility_date = "2026-01-28"
+minify = true
+
+[observability]
+enabled = true
+
+  [observability.logs]
+  invocation_logs = true
+  head_sampling_rate = 1
 
 [triggers]
-crons = ["* * * * *", "0 0 * * *"]
+crons = ["* * * * *", "0 0 * * *", "30 0 * * *"]
 
 [[d1_databases]]
 binding = "DB"
@@ -15,3 +23,6 @@ database_id = "00000000-0000-0000-0000-000000000000"
 [vars]
 ADMIN_RATE_LIMIT_MAX = "60"
 ADMIN_RATE_LIMIT_WINDOW_SEC = "60"
+UPTIMER_SCHEDULED_STATUS_REFRESH = "1"
+UPTIMER_TRUST_SCHEDULED_RUNTIME_UPDATES = "1"
+UPTIMER_INTERNAL_SCHEDULED_BATCH_SIZE = "2"

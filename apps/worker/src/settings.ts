@@ -45,6 +45,22 @@ const DEFAULTS: SettingsResponse['settings'] = {
 
 type SettingsRow = { key: string; value: string };
 
+const READ_SETTINGS_SQL = 'SELECT key, value FROM settings';
+const UPSERT_SETTING_SQL = `
+  INSERT INTO settings (key, value)
+  VALUES (?1, ?2)
+  ON CONFLICT(key) DO UPDATE SET value = excluded.value
+`;
+
+const readSettingsStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+const patchSettingsStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+
+const SETTINGS_CACHE_TTL_MS = 60_000;
+const settingsCacheByDb = new WeakMap<
+  D1Database,
+  { fetchedAtMs: number; settings: SettingsResponse['settings'] }
+>();
+
 function parseIntSetting(
   raw: string | undefined,
   opts: { min: number; max: number },
@@ -86,8 +102,24 @@ export function parseSettingsPatch(rawBody: unknown): SettingsPatchInput {
   return r.data;
 }
 
-export async function readSettings(db: D1Database): Promise<SettingsResponse['settings']> {
-  const { results } = await db.prepare('SELECT key, value FROM settings').all<SettingsRow>();
+export async function readSettings(
+  db: D1Database,
+  opts: { bypassCache?: boolean } = {},
+): Promise<SettingsResponse['settings']> {
+  if (!opts.bypassCache) {
+    const cachedResult = settingsCacheByDb.get(db);
+    if (cachedResult && Date.now() - cachedResult.fetchedAtMs < SETTINGS_CACHE_TTL_MS) {
+      return cachedResult.settings;
+    }
+  }
+
+  const cached = readSettingsStatementByDb.get(db);
+  const statement = cached ?? db.prepare(READ_SETTINGS_SQL);
+  if (!cached) {
+    readSettingsStatementByDb.set(db, statement);
+  }
+
+  const { results } = await statement.all<SettingsRow>();
 
   const map = new Map<string, string>();
   for (const r of results ?? []) {
@@ -138,7 +170,7 @@ export async function readSettings(db: D1Database): Promise<SettingsResponse['se
     max: 5,
   }) ?? DEFAULTS.uptime_rating_level) as 1 | 2 | 3 | 4 | 5;
 
-  return {
+  const settings: SettingsResponse['settings'] = {
     site_title,
     site_description,
     site_locale,
@@ -154,29 +186,31 @@ export async function readSettings(db: D1Database): Promise<SettingsResponse['se
 
     uptime_rating_level,
   };
+
+  if (!opts.bypassCache) {
+    settingsCacheByDb.set(db, { fetchedAtMs: Date.now(), settings });
+  }
+  return settings;
 }
 
 export async function patchSettings(db: D1Database, patch: SettingsPatchInput): Promise<void> {
   const statements: D1PreparedStatement[] = [];
+
+  const cached = patchSettingsStatementByDb.get(db);
+  const statement = cached ?? db.prepare(UPSERT_SETTING_SQL);
+  if (!cached) {
+    patchSettingsStatementByDb.set(db, statement);
+  }
 
   for (const [key, value] of Object.entries(patch)) {
     if (value === undefined) continue;
 
     const strValue = typeof value === 'string' ? value : String(value);
 
-    statements.push(
-      db
-        .prepare(
-          `
-          INSERT INTO settings (key, value)
-          VALUES (?1, ?2)
-          ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        `,
-        )
-        .bind(key, strValue),
-    );
+    statements.push(statement.bind(key, strValue));
   }
 
   if (statements.length === 0) return;
   await db.batch(statements);
+  settingsCacheByDb.delete(db);
 }

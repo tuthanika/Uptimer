@@ -37,6 +37,10 @@ describe('admin settings homepage snapshot refresh', () => {
         },
       },
       {
+        match: 'public_snapshot_guard_versions',
+        run: () => ({ meta: { changes: 1 } }),
+      },
+      {
         match: 'select key, value from settings',
         all: () =>
           [...settingsMap.entries()].map(([key, value]) => ({

@@ -270,7 +270,14 @@ jobs:
           if not replaced:
               raise SystemExit(f'No [[d1_databases]] block found with binding = "{d1_binding}".')
 
-          dst.write_text("".join(out), encoding="utf-8")
+          final = "".join(out)
+
+          # Optional optimization: create a self service binding so the scheduler can
+          # offload snapshot refresh into a separate invocation without public HTTP self-fetch.
+          if 'binding = "SELF"' not in final:
+              final = final.rstrip() + f'\n\n[[services]]\nbinding = "SELF"\nservice = "{worker_name}"\n'
+
+          dst.write_text(final, encoding="utf-8")
           print(f"Wrote {dst}")
           PY
 

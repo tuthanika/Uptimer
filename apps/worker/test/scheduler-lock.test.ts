@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { acquireLease } from '../src/scheduler/lock';
+import { acquireLease, releaseLease } from '../src/scheduler/lock';
 import { createFakeD1Database, type FakeD1QueryHandler } from './helpers/fake-d1';
 
 describe('scheduler/lock', () => {
@@ -43,5 +43,21 @@ describe('scheduler/lock', () => {
     ]);
 
     await expect(acquireLease(db, 'retention', 200, 600)).resolves.toBe(false);
+  });
+
+  it('releases only the lease row matching the claimed expiry', async () => {
+    let boundArgs: unknown[] | null = null;
+    const db = createFakeD1Database([
+      {
+        match: 'delete from locks',
+        run: (args) => {
+          boundArgs = args;
+          return { meta: { changes: 1 } };
+        },
+      },
+    ]);
+
+    await expect(releaseLease(db, 'scheduler:tick', 155)).resolves.toBeUndefined();
+    expect(boundArgs).toEqual(['scheduler:tick', 155]);
   });
 });

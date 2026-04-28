@@ -217,6 +217,13 @@ export const publicSnapshots = sqliteTable('public_snapshots', {
     .default(sql`(CAST(strftime('%s','now') AS INTEGER))`),
 });
 
+export const publicSnapshotGuardVersions = sqliteTable('public_snapshot_guard_versions', {
+  key: text('key').primaryKey(),
+  version: integer('version').notNull(),
+  updatedAt: integer('updated_at').notNull(),
+  stateJson: text('state_json'),
+});
+
 export const locks = sqliteTable('locks', {
   name: text('name').primaryKey(),
   expiresAt: integer('expires_at').notNull(),

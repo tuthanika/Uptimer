@@ -68,6 +68,7 @@ Every change must:
 
 - Monitor targets are controlled SSRF: restrict protocols, deny private/reserved IP ranges by default. Port range 1-65535 is allowed. See `Develop/Application.md` for specifics.
 - Admin Token goes only in Workers Secrets or `.dev.vars` (local). Never in Git, D1, or frontend code.
+- Cloudflare API credentials for local Dev operations are stored in `.env` (gitignored). Load them only for required Wrangler commands; never print, commit, copy into docs, or expose token values in tool output.
 - Webhook signing secrets must reference Worker secrets — never store in the database.
 
 ---

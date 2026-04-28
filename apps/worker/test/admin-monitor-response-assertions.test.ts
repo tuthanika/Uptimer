@@ -119,6 +119,10 @@ function createEnv(monitorsById: Map<number, StoredMonitorRow>): Env {
         return row ? [monitorRowToRaw(row)] : [];
       },
     },
+    {
+      match: 'public_snapshot_guard_versions',
+      run: () => ({ meta: { changes: 1 } }),
+    },
   ];
 
   return {

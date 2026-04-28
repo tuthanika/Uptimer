@@ -6,6 +6,13 @@ import {
   overlapSeconds,
   sumIntervals,
 } from '../analytics/uptime';
+import {
+  materializeMonitorRuntimeTotals,
+  readPublicMonitorRuntimeSnapshot,
+  runtimeEntryToHeartbeats,
+  snapshotHasMonitorIds,
+  toMonitorRuntimeEntryMap,
+} from './monitor-runtime';
 import { readSettings } from '../settings';
 import {
   buildNumberedPlaceholders,
@@ -108,12 +115,27 @@ export type FilteredMaintenanceWindowEntry = {
   monitorIds: number[];
 };
 
+export type VisibleActiveIncidentSummary = {
+  items: FilteredIncidentEntry[];
+  bannerIncident: FilteredIncidentEntry | null;
+};
+
 export const STATUS_ACTIVE_INCIDENT_LIMIT = 5;
 export const STATUS_ACTIVE_MAINTENANCE_LIMIT = 3;
 export const STATUS_UPCOMING_MAINTENANCE_LIMIT = 5;
 
 const UPTIME_DAYS = 30;
 const HEARTBEAT_POINTS = 60;
+const D1_MAX_SQL_VARIABLES = 100;
+const TODAY_PARTIAL_UPTIME_FIXED_BINDINGS = 2;
+const TODAY_PARTIAL_UPTIME_BINDINGS_PER_MONITOR = 4;
+const TODAY_PARTIAL_UPTIME_SQL_CHUNK_SIZE = Math.max(
+  1,
+  Math.floor(
+    (D1_MAX_SQL_VARIABLES - TODAY_PARTIAL_UPTIME_FIXED_BINDINGS) /
+      TODAY_PARTIAL_UPTIME_BINDINGS_PER_MONITOR,
+  ),
+);
 
 function appendMapValue<K, V>(map: Map<K, V[]>, key: K, value: V): void {
   const existing = map.get(key);
@@ -122,6 +144,98 @@ function appendMapValue<K, V>(map: Map<K, V[]>, key: K, value: V): void {
     return;
   }
   map.set(key, [value]);
+}
+
+function incidentImpactRank(
+  impact: PublicStatusResponse['active_incidents'][number]['impact'],
+): number {
+  switch (impact) {
+    case 'critical':
+      return 3;
+    case 'major':
+      return 2;
+    case 'minor':
+      return 1;
+    case 'none':
+    default:
+      return 0;
+  }
+}
+
+function chooseTopIncidentEntry(
+  entries: readonly FilteredIncidentEntry[],
+): FilteredIncidentEntry | null {
+  let best: FilteredIncidentEntry | null = null;
+
+  for (const entry of entries) {
+    if (!best) {
+      best = entry;
+      continue;
+    }
+
+    const candidateRank = incidentImpactRank(toIncidentImpact(entry.row.impact));
+    const bestRank = incidentImpactRank(toIncidentImpact(best.row.impact));
+    if (candidateRank > bestRank) {
+      best = entry;
+      continue;
+    }
+    if (candidateRank < bestRank) {
+      continue;
+    }
+
+    if (entry.row.started_at > best.row.started_at) {
+      best = entry;
+      continue;
+    }
+    if (entry.row.started_at === best.row.started_at && entry.row.id > best.row.id) {
+      best = entry;
+    }
+  }
+
+  return best;
+}
+
+async function mapVisibleIncidentEntries(
+  db: D1Database,
+  rows: IncidentRow[],
+  includeHiddenMonitors: boolean,
+): Promise<Map<number, FilteredIncidentEntry>> {
+  const byId = new Map<number, FilteredIncidentEntry>();
+  if (rows.length === 0) {
+    return byId;
+  }
+
+  const incidentMonitorIdsByIncidentId = await listIncidentMonitorIdsByIncidentId(
+    db,
+    rows.map((row) => row.id),
+  );
+
+  const statusPageVisibleMonitorIds = includeHiddenMonitors
+    ? new Set<number>()
+    : await listStatusPageVisibleMonitorIds(
+        db,
+        [...incidentMonitorIdsByIncidentId.values()].flat(),
+      );
+
+  for (const row of rows) {
+    const originalMonitorIds = incidentMonitorIdsByIncidentId.get(row.id) ?? [];
+    const visibleMonitorIds = filterStatusPageScopedMonitorIds(
+      originalMonitorIds,
+      statusPageVisibleMonitorIds,
+      includeHiddenMonitors,
+    );
+
+    if (!shouldIncludeStatusPageScopedItem(originalMonitorIds, visibleMonitorIds)) {
+      continue;
+    }
+
+    byId.set(row.id, {
+      row,
+      monitorIds: visibleMonitorIds,
+    });
+  }
+
+  return byId;
 }
 
 export function toMonitorStatus(value: string | null): MonitorStatus {
@@ -402,6 +516,308 @@ export async function computeTodayPartialUptimeBatch(
   rangeStart: number,
   now: number,
 ): Promise<Map<number, UptimeWindowTotals>> {
+  try {
+    return await computeTodayPartialUptimeBatchSql(db, monitors, rangeStart, now);
+  } catch (err) {
+    console.warn('uptime: today batch SQL failed, falling back to legacy', err);
+    return await computeTodayPartialUptimeBatchLegacy(db, monitors, rangeStart, now);
+  }
+}
+
+async function computeTodayPartialUptimeBatchSql(
+  db: D1Database,
+  monitors: Array<{
+    id: number;
+    interval_sec: number;
+    created_at: number;
+    last_checked_at: number | null;
+  }>,
+  rangeStart: number,
+  now: number,
+): Promise<Map<number, UptimeWindowTotals>> {
+  const out = new Map<number, UptimeWindowTotals>();
+
+  const monitorById = new Map<number, (typeof monitors)[number]>();
+  for (const monitor of monitors) {
+    if (!Number.isInteger(monitor.id) || monitor.id <= 0) continue;
+    if (monitorById.has(monitor.id)) continue;
+    monitorById.set(monitor.id, monitor);
+  }
+
+  const normalizedMonitors = [...monitorById.values()];
+  if (normalizedMonitors.length === 0) return out;
+
+  const ids = normalizedMonitors.map((monitor) => monitor.id);
+
+  if (now <= rangeStart) {
+    for (const id of ids) {
+      out.set(id, {
+        total_sec: 0,
+        downtime_sec: 0,
+        unknown_sec: 0,
+        uptime_sec: 0,
+        uptime_pct: null,
+      });
+    }
+    return out;
+  }
+
+  for (const id of ids) {
+    out.set(id, {
+      total_sec: 0,
+      downtime_sec: 0,
+      unknown_sec: 0,
+      uptime_sec: 0,
+      uptime_pct: null,
+    });
+  }
+
+  for (
+    let start = 0;
+    start < normalizedMonitors.length;
+    start += TODAY_PARTIAL_UPTIME_SQL_CHUNK_SIZE
+  ) {
+    const chunk = normalizedMonitors.slice(start, start + TODAY_PARTIAL_UPTIME_SQL_CHUNK_SIZE);
+    const valuesPlaceholders = chunk
+      .map((_, index) => {
+        const base = 3 + index * 4;
+        return `(?${base}, ?${base + 1}, ?${base + 2}, ?${base + 3})`;
+      })
+      .join(', ');
+
+    const stmt = db.prepare(
+      `
+      WITH input(monitor_id, interval_sec, created_at, last_checked_at) AS (
+        VALUES ${valuesPlaceholders}
+      ),
+      first_checks AS (
+        SELECT monitor_id, MIN(checked_at) AS first_check_at
+        FROM check_results
+        WHERE monitor_id IN (SELECT monitor_id FROM input)
+          AND checked_at >= ?1
+          AND checked_at < ?2
+        GROUP BY monitor_id
+      ),
+      effective AS (
+        SELECT
+          i.monitor_id AS monitor_id,
+          i.interval_sec AS interval_sec,
+          CASE
+            WHEN i.created_at >= ?1 THEN
+              COALESCE(
+                fc.first_check_at,
+                CASE WHEN i.last_checked_at IS NULL THEN NULL ELSE i.created_at END
+              )
+            ELSE ?1
+          END AS start_at
+        FROM input i
+        LEFT JOIN first_checks fc ON fc.monitor_id = i.monitor_id
+      ),
+      downtime_segments AS (
+        SELECT
+          o.monitor_id AS monitor_id,
+          max(o.started_at, e.start_at) AS seg_start,
+          min(coalesce(o.ended_at, ?2), ?2) AS seg_end
+        FROM outages o
+        JOIN effective e ON e.monitor_id = o.monitor_id
+        WHERE e.start_at IS NOT NULL
+          AND o.started_at < ?2
+          AND (o.ended_at IS NULL OR o.ended_at > e.start_at)
+      ),
+      downtime AS (
+        SELECT monitor_id, sum(max(0, seg_end - seg_start)) AS downtime_sec
+        FROM downtime_segments
+        GROUP BY monitor_id
+      ),
+      checks AS (
+        SELECT
+          cr.monitor_id AS monitor_id,
+          cr.checked_at AS checked_at,
+          cr.status AS status,
+          e.interval_sec AS interval_sec,
+          e.start_at AS start_at,
+          lag(cr.checked_at) OVER (
+            PARTITION BY cr.monitor_id
+            ORDER BY cr.checked_at
+          ) AS prev_at,
+          lag(cr.status) OVER (
+            PARTITION BY cr.monitor_id
+            ORDER BY cr.checked_at
+          ) AS prev_status
+        FROM check_results cr
+        JOIN effective e ON e.monitor_id = cr.monitor_id
+        WHERE e.start_at IS NOT NULL
+          AND cr.checked_at >= max(0, e.start_at - e.interval_sec * 2)
+          AND cr.checked_at < ?2
+      ),
+      unknown_checks AS (
+        SELECT
+          monitor_id AS monitor_id,
+          CASE
+            WHEN prev_at IS NULL THEN start_at
+            WHEN prev_status = 'unknown' THEN (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END)
+            ELSE max(
+              (CASE WHEN prev_at >= start_at THEN prev_at ELSE start_at END),
+              prev_at + interval_sec * 2
+            )
+          END AS seg_start,
+          checked_at AS seg_end
+        FROM checks
+        WHERE checked_at >= start_at
+      ),
+      last_any AS (
+        SELECT monitor_id, checked_at, status
+        FROM (
+          SELECT
+            monitor_id,
+            checked_at,
+            status,
+            row_number() OVER (
+              PARTITION BY monitor_id
+              ORDER BY checked_at DESC
+            ) AS rn
+          FROM checks
+        )
+        WHERE rn = 1
+      ),
+      last_in_range AS (
+        SELECT monitor_id, checked_at
+        FROM (
+          SELECT
+            monitor_id,
+            checked_at,
+            row_number() OVER (
+              PARTITION BY monitor_id
+              ORDER BY checked_at DESC
+            ) AS rn
+          FROM checks
+          WHERE checked_at >= start_at
+        )
+        WHERE rn = 1
+      ),
+      unknown_tail AS (
+        SELECT
+          e.monitor_id AS monitor_id,
+          CASE
+            WHEN la.checked_at IS NULL THEN coalesce(lir.checked_at, e.start_at)
+            WHEN la.status = 'unknown' THEN coalesce(lir.checked_at, e.start_at)
+            ELSE max(coalesce(lir.checked_at, e.start_at), la.checked_at + e.interval_sec * 2)
+          END AS seg_start,
+          ?2 AS seg_end
+        FROM effective e
+        LEFT JOIN last_any la ON la.monitor_id = e.monitor_id
+        LEFT JOIN last_in_range lir ON lir.monitor_id = e.monitor_id
+        WHERE e.start_at IS NOT NULL
+      ),
+      unknown_segments AS (
+        SELECT monitor_id, seg_start, seg_end
+        FROM unknown_checks
+        WHERE seg_end > seg_start
+        UNION ALL
+        SELECT monitor_id, seg_start, seg_end
+        FROM unknown_tail
+        WHERE seg_end > seg_start
+      ),
+      unknown_raw AS (
+        SELECT monitor_id, sum(seg_end - seg_start) AS unknown_raw_sec
+        FROM unknown_segments
+        GROUP BY monitor_id
+      ),
+      unknown_overlap AS (
+        SELECT
+          u.monitor_id AS monitor_id,
+          sum(
+            max(0, min(u.seg_end, d.seg_end) - max(u.seg_start, d.seg_start))
+          ) AS overlap_sec
+        FROM unknown_segments u
+        JOIN downtime_segments d ON d.monitor_id = u.monitor_id
+        WHERE u.seg_end > d.seg_start AND d.seg_end > u.seg_start
+        GROUP BY u.monitor_id
+      )
+      SELECT
+        e.monitor_id AS monitor_id,
+        e.start_at AS start_at,
+        (?2 - e.start_at) AS total_sec,
+        coalesce(d.downtime_sec, 0) AS downtime_sec,
+        max(0, coalesce(u.unknown_raw_sec, 0) - coalesce(o.overlap_sec, 0)) AS unknown_sec
+      FROM effective e
+      LEFT JOIN downtime d ON d.monitor_id = e.monitor_id
+      LEFT JOIN unknown_raw u ON u.monitor_id = e.monitor_id
+      LEFT JOIN unknown_overlap o ON o.monitor_id = e.monitor_id
+      WHERE e.start_at IS NOT NULL
+      `,
+    );
+
+    const args: unknown[] = [rangeStart, now];
+    for (const monitor of chunk) {
+      args.push(monitor.id, monitor.interval_sec, monitor.created_at, monitor.last_checked_at);
+    }
+
+    const { results } = await stmt
+      .bind(...args)
+      .all<{
+        monitor_id: number;
+        start_at: number;
+        total_sec: number;
+        downtime_sec: number;
+        unknown_sec: number;
+      }>();
+
+    const rows = results ?? [];
+    const shouldReturnAtLeastOneRow = chunk.some(
+      (monitor) => monitor.created_at <= rangeStart || monitor.last_checked_at !== null,
+    );
+    if (shouldReturnAtLeastOneRow && rows.length === 0) {
+      throw new Error('uptime: today batch SQL returned no rows');
+    }
+
+    for (const row of rows) {
+      if (
+        !Number.isInteger(row.monitor_id) ||
+        row.monitor_id <= 0 ||
+        !Number.isFinite(row.total_sec) ||
+        !Number.isFinite(row.downtime_sec) ||
+        !Number.isFinite(row.unknown_sec)
+      ) {
+        throw new Error('uptime: today batch SQL returned an invalid row');
+      }
+
+      const monitorId = row.monitor_id;
+      if (!monitorById.has(monitorId)) continue;
+
+      const total_sec = Math.max(0, row.total_sec ?? 0);
+      if (total_sec === 0) continue;
+
+      const downtime_sec = Math.max(0, row.downtime_sec ?? 0);
+      const unknown_sec = Math.max(0, row.unknown_sec ?? 0);
+      const unavailable_sec = Math.min(total_sec, downtime_sec + unknown_sec);
+      const uptime_sec = Math.max(0, total_sec - unavailable_sec);
+      const uptime_pct = total_sec === 0 ? null : (uptime_sec / total_sec) * 100;
+
+      out.set(monitorId, {
+        total_sec,
+        downtime_sec,
+        unknown_sec,
+        uptime_sec,
+        uptime_pct,
+      });
+    }
+  }
+
+  return out;
+}
+
+async function computeTodayPartialUptimeBatchLegacy(
+  db: D1Database,
+  monitors: Array<{
+    id: number;
+    interval_sec: number;
+    created_at: number;
+    last_checked_at: number | null;
+  }>,
+  rangeStart: number,
+  now: number,
+): Promise<Map<number, UptimeWindowTotals>> {
   const out = new Map<number, UptimeWindowTotals>();
 
   const monitorById = new Map<
@@ -492,13 +908,13 @@ export async function computeTodayPartialUptimeBatch(
 
     const monitorRangeStart = Math.max(rangeStart, monitor.created_at);
     const checks = checksById.get(id) ?? [];
-    const checksSinceMonitorStart =
-      monitorRangeStart > rangeStart
-        ? checks.filter((check) => check.checked_at >= monitorRangeStart)
-        : checks;
+    const isNewWithinRange = monitor.created_at >= rangeStart;
+    const checksSinceMonitorStart = isNewWithinRange
+      ? checks.filter((check) => check.checked_at >= monitorRangeStart)
+      : checks;
     let effectiveRangeStart: number | null = monitorRangeStart;
 
-    if (monitorRangeStart > rangeStart) {
+    if (isNewWithinRange) {
       const firstCheckAt = checksSinceMonitorStart[0]?.checked_at;
       effectiveRangeStart =
         firstCheckAt ?? (monitor.last_checked_at === null ? null : monitorRangeStart);
@@ -659,9 +1075,17 @@ export async function buildPublicMonitorCards(
 
   const ids = monitorsList.map((m) => m.id);
   if (ids.length > 0) {
+    const runtimeSnapshot = await readPublicMonitorRuntimeSnapshot(db, now);
+    const runtimeById =
+      runtimeSnapshot && snapshotHasMonitorIds(runtimeSnapshot, ids)
+        ? toMonitorRuntimeEntryMap(runtimeSnapshot)
+        : null;
     const placeholders = ids.map((_, idx) => `?${idx + 1}`).join(', ');
     const todayStartAt = utcDayStart(now);
-    const needsToday = rangeEnd > rangeEndFullDays && todayStartAt >= rangeStart;
+    // Always compute a partial "today" bucket whenever we're inside the current UTC day.
+    // This keeps new deployments (where rangeStart may be after today's 00:00) from
+    // showing empty uptime strips until the next daily rollup.
+    const needsToday = rangeEnd > rangeEndFullDays;
 
     const rollupsPromise = db
       .prepare(
@@ -679,21 +1103,38 @@ export async function buildPublicMonitorCards(
       .then(({ results }) => results ?? []);
 
     const todayByMonitorIdPromise: Promise<Map<number, UptimeWindowTotals>> = needsToday
-      ? computeTodayPartialUptimeBatch(
-          db,
-          rawMonitors.map((monitor) => ({
-            id: monitor.id,
-            interval_sec: monitor.interval_sec,
-            created_at: monitor.created_at,
-            last_checked_at: monitor.last_checked_at,
-          })),
-          Math.max(todayStartAt, rangeStart),
-          rangeEnd,
-        )
+      ? runtimeById
+        ? Promise.resolve(
+            new Map<number, UptimeWindowTotals>(
+              rawMonitors.map((monitor) => [
+                monitor.id,
+                materializeMonitorRuntimeTotals(runtimeById.get(monitor.id)!, rangeEnd),
+              ]),
+            ),
+          )
+        : computeTodayPartialUptimeBatch(
+            db,
+            rawMonitors.map((monitor) => ({
+              id: monitor.id,
+              interval_sec: monitor.interval_sec,
+              created_at: monitor.created_at,
+              last_checked_at: monitor.last_checked_at,
+            })),
+            Math.max(todayStartAt, rangeStart),
+            rangeEnd,
+          )
       : Promise.resolve(new Map<number, UptimeWindowTotals>());
 
     const [heartbeatsByMonitorId, rollupRows, todayByMonitorId] = await Promise.all([
-      listHeartbeatsByMonitorId(db, ids, HEARTBEAT_POINTS),
+      runtimeById
+        ? Promise.resolve(
+            new Map(
+              ids.map((id) => [id, runtimeEntryToHeartbeats(runtimeById.get(id)!)]) as Array<
+                [number, PublicStatusResponse['monitors'][number]['heartbeats']]
+              >,
+            ),
+          )
+        : listHeartbeatsByMonitorId(db, ids, HEARTBEAT_POINTS),
       rollupsPromise,
       todayByMonitorIdPromise,
     ]);
@@ -797,6 +1238,13 @@ export async function listVisibleActiveIncidents(
   db: D1Database,
   includeHiddenMonitors: boolean,
 ): Promise<FilteredIncidentEntry[]> {
+  return (await readVisibleActiveIncidentSummary(db, includeHiddenMonitors)).items;
+}
+
+export async function readVisibleActiveIncidentSummary(
+  db: D1Database,
+  includeHiddenMonitors: boolean,
+): Promise<VisibleActiveIncidentSummary> {
   const incidentVisibilitySql = incidentStatusPageVisibilityPredicate(includeHiddenMonitors);
   const { results } = await db
     .prepare(
@@ -813,38 +1261,46 @@ export async function listVisibleActiveIncidents(
     .all<IncidentRow>();
 
   const rows = results ?? [];
-  const incidentMonitorIdsByIncidentId = await listIncidentMonitorIdsByIncidentId(
+  let bannerRow: IncidentRow | null = null;
+  if (rows.length >= STATUS_ACTIVE_INCIDENT_LIMIT) {
+    bannerRow = await db
+      .prepare(
+        `
+        SELECT id, title, status, impact, message, started_at, resolved_at
+        FROM incidents
+        WHERE status != 'resolved'
+          AND ${incidentVisibilitySql}
+        ORDER BY
+          CASE impact
+            WHEN 'critical' THEN 3
+            WHEN 'major' THEN 2
+            WHEN 'minor' THEN 1
+            ELSE 0
+          END DESC,
+          started_at DESC,
+          id DESC
+        LIMIT 1
+      `,
+      )
+      .first<IncidentRow>();
+  }
+
+  const visibleEntriesById = await mapVisibleIncidentEntries(
     db,
-    rows.map((r) => r.id),
+    bannerRow && !rows.some((row) => row.id === bannerRow?.id) ? [...rows, bannerRow] : rows,
+    includeHiddenMonitors,
   );
-
-  const statusPageVisibleMonitorIds = includeHiddenMonitors
-    ? new Set<number>()
-    : await listStatusPageVisibleMonitorIds(
-        db,
-        [...incidentMonitorIdsByIncidentId.values()].flat(),
-      );
-
-  return rows
-    .map((row) => {
-      const originalMonitorIds = incidentMonitorIdsByIncidentId.get(row.id) ?? [];
-      const visibleMonitorIds = filterStatusPageScopedMonitorIds(
-        originalMonitorIds,
-        statusPageVisibleMonitorIds,
-        includeHiddenMonitors,
-      );
-
-      if (!shouldIncludeStatusPageScopedItem(originalMonitorIds, visibleMonitorIds)) {
-        return null;
-      }
-
-      return {
-        row,
-        monitorIds: visibleMonitorIds,
-      };
-    })
+  const items = rows
+    .map((row) => visibleEntriesById.get(row.id) ?? null)
     .filter((entry): entry is FilteredIncidentEntry => entry !== null)
     .slice(0, STATUS_ACTIVE_INCIDENT_LIMIT);
+
+  return {
+    items,
+    bannerIncident: bannerRow
+      ? (visibleEntriesById.get(bannerRow.id) ?? null)
+      : chooseTopIncidentEntry(items),
+  };
 }
 
 export async function listVisibleMaintenanceWindows(
@@ -854,6 +1310,7 @@ export async function listVisibleMaintenanceWindows(
 ): Promise<{
   active: FilteredMaintenanceWindowEntry[];
   upcoming: FilteredMaintenanceWindowEntry[];
+  activeMonitorIds: ReadonlySet<number>;
 }> {
   const maintenanceVisibilitySql = maintenanceWindowStatusPageVisibilityPredicate(
     includeHiddenMonitors,
@@ -951,11 +1408,48 @@ export async function listVisibleMaintenanceWindows(
     .filter((entry): entry is FilteredMaintenanceWindowEntry => entry !== null)
     .slice(0, STATUS_UPCOMING_MAINTENANCE_LIMIT);
 
-  return { active, upcoming };
+  const activeMonitorIds = new Set<number>();
+  if (activeRows.length >= STATUS_ACTIVE_MAINTENANCE_LIMIT) {
+    const { results: activeMonitorResults } = await db
+      .prepare(
+        `
+      SELECT DISTINCT mwm.monitor_id
+      FROM maintenance_windows mw
+      JOIN maintenance_window_monitors mwm ON mwm.maintenance_window_id = mw.id
+      WHERE mw.starts_at <= ?1 AND mw.ends_at > ?1
+        AND ${maintenanceWindowStatusPageVisibilityPredicate(includeHiddenMonitors, 'mw')}
+    `,
+      )
+      .bind(now)
+      .all<{ monitor_id: number }>();
+
+    for (const row of activeMonitorResults ?? []) {
+      if (
+        typeof row.monitor_id === 'number' &&
+        Number.isInteger(row.monitor_id) &&
+        row.monitor_id > 0
+      ) {
+        activeMonitorIds.add(row.monitor_id);
+      }
+    }
+  } else {
+    for (const monitorIds of activeWindowMonitorIdsByWindowId.values()) {
+      for (const monitorId of monitorIds) {
+        if (typeof monitorId === 'number' && Number.isInteger(monitorId) && monitorId > 0) {
+          activeMonitorIds.add(monitorId);
+        }
+      }
+    }
+  }
+
+  return { active, upcoming, activeMonitorIds };
 }
 
-export async function readPublicSiteSettings(db: D1Database) {
-  return readSettings(db);
+export async function readPublicSiteSettings(
+  db: D1Database,
+  opts?: { bypassCache?: boolean },
+) {
+  return readSettings(db, opts);
 }
 
 export function buildPublicStatusBanner(opts: {
@@ -963,27 +1457,12 @@ export function buildPublicStatusBanner(opts: {
   monitorCount: number;
   activeIncidents: FilteredIncidentEntry[];
   activeMaintenanceWindows: FilteredMaintenanceWindowEntry[];
+  bannerIncident?: FilteredIncidentEntry | null;
 }): Banner {
-  const { counts, monitorCount, activeIncidents, activeMaintenanceWindows } = opts;
-  const incidents = activeIncidents.map((entry) => entry.row);
-  if (incidents.length > 0) {
-    const impactRank = (impact: PublicStatusResponse['active_incidents'][number]['impact']) => {
-      switch (impact) {
-        case 'critical':
-          return 3;
-        case 'major':
-          return 2;
-        case 'minor':
-          return 1;
-        case 'none':
-        default:
-          return 0;
-      }
-    };
-
-    const maxImpact = incidents
-      .map((it) => toIncidentImpact(it.impact))
-      .reduce((acc, it) => (impactRank(it) > impactRank(acc) ? it : acc), 'none' as const);
+  const { counts, monitorCount, activeIncidents, activeMaintenanceWindows, bannerIncident } = opts;
+  const topIncident = bannerIncident?.row ?? chooseTopIncidentEntry(activeIncidents)?.row ?? null;
+  if (topIncident) {
+    const maxImpact = topIncident ? toIncidentImpact(topIncident.impact) : ('none' as const);
 
     const status: BannerStatus =
       maxImpact === 'critical' || maxImpact === 'major'
@@ -999,17 +1478,16 @@ export function buildPublicStatusBanner(opts: {
           ? 'Partial Outage'
           : 'Incident';
 
-    const top = incidents[0];
     return {
       source: 'incident',
       status,
       title,
-      incident: top
+      incident: topIncident
         ? {
-            id: top.id,
-            title: top.title,
-            status: toIncidentStatus(top.status),
-            impact: toIncidentImpact(top.impact),
+            id: topIncident.id,
+            title: topIncident.title,
+            status: toIncidentStatus(topIncident.status),
+            impact: toIncidentImpact(topIncident.impact),
           }
         : null,
     };

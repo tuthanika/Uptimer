@@ -58,6 +58,49 @@ type PersistedStatusCache = {
   value: StatusResponse;
 };
 
+type CompactLatencyResponse = Omit<LatencyResponse, 'points'> & {
+  points: {
+    checked_at: number[];
+    status_codes: string;
+    latency_ms: Array<number | null>;
+  };
+};
+
+function isCompactLatencyResponse(
+  value: LatencyResponse | CompactLatencyResponse,
+): value is CompactLatencyResponse {
+  if (Array.isArray(value.points) || !value.points || typeof value.points !== 'object') {
+    return false;
+  }
+
+  return (
+    Array.isArray(value.points.checked_at) &&
+    typeof value.points.status_codes === 'string' &&
+    Array.isArray(value.points.latency_ms)
+  );
+}
+
+function decodeCompactLatencyResponse(raw: CompactLatencyResponse): LatencyResponse {
+  return {
+    ...raw,
+    points: raw.points.checked_at.map((checked_at, index) => {
+      const code = raw.points.status_codes[index] ?? 'x';
+      return {
+        checked_at,
+        status:
+          code === 'u'
+            ? 'up'
+            : code === 'd'
+              ? 'down'
+              : code === 'm'
+                ? 'maintenance'
+                : 'unknown',
+        latency_ms: raw.points.latency_ms[index] ?? null,
+      };
+    }),
+  };
+}
+
 function getCachedPublic<T>(key: string): T | null {
   const hit = publicCache.get(key);
   if (!hit) return null;
@@ -255,13 +298,14 @@ export async function fetchLatency(
   monitorId: number,
   range: '24h' = '24h',
 ): Promise<LatencyResponse> {
-  const url = `${API_BASE}/public/monitors/${monitorId}/latency?range=${range}`;
+  const url = `${API_BASE}/public/monitors/${monitorId}/latency?range=${range}&format=compact-v1`;
   const auth = getOptionalPublicAuth();
   const cached = auth.shouldBypassCache ? null : getCachedPublic<LatencyResponse>(url);
   if (cached) return cached;
   try {
     const res = await fetch(url, auth.fetchInit);
-    const data = await handleResponse<LatencyResponse>(res);
+    const raw = await handleResponse<LatencyResponse | CompactLatencyResponse>(res);
+    const data = isCompactLatencyResponse(raw) ? decodeCompactLatencyResponse(raw) : raw;
     if (!auth.shouldBypassCache) setCachedPublic(url, data);
     return data;
   } catch (err) {

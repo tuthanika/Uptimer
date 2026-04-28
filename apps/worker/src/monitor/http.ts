@@ -45,6 +45,16 @@ async function fetchWithTimeout(
   timeoutMs: number,
   init: RequestInit,
 ): Promise<Response> {
+  // Prefer AbortSignal.timeout when available (avoids setTimeout + event listener overhead).
+  const timeoutFn = (AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal }).timeout;
+  const isWorkersRuntime =
+    typeof navigator !== 'undefined' &&
+    typeof navigator.userAgent === 'string' &&
+    navigator.userAgent === 'Cloudflare-Workers';
+  if (isWorkersRuntime && !init.signal && typeof timeoutFn === 'function') {
+    return fetch(url, { ...init, signal: timeoutFn(timeoutMs) });
+  }
+
   const controller = new AbortController();
 
   // If the caller also passes a signal, forward abort.

@@ -33,7 +33,7 @@ function installCacheMock() {
 function sampleArtifactSnapshot(now = 190) {
   return {
     generated_at: now,
-    bootstrap_mode: 'partial' as const,
+    bootstrap_mode: 'full' as const,
     monitor_count_total: 40,
     site_title: 'Status Hub',
     site_description: 'Production services',
@@ -70,7 +70,7 @@ function sampleRender(now = 190) {
   return {
     generated_at: snapshot.generated_at,
     preload_html: '<div id="uptimer-preload"></div>',
-    snapshot,
+    snapshot_json: JSON.stringify(snapshot),
     meta_title: snapshot.site_title,
     meta_description: snapshot.banner.title,
   };
@@ -101,7 +101,7 @@ async function requestHomepage(
   return { res, waitUntil };
 }
 
-describe('public homepage downgrade guard', () => {
+describe('public homepage fallback semantics', () => {
   const originalCaches = (globalThis as { caches?: unknown }).caches;
 
   afterEach(() => {
@@ -118,7 +118,7 @@ describe('public homepage downgrade guard', () => {
     computePublicStatusPayload.mockReset();
   });
 
-  it('keeps a recent homepage artifact when live status compute would downgrade it to unknown', async () => {
+  it('does not mask a newly unknown homepage behind a recent artifact snapshot', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(260_000);
     let statusSnapshotWrites = 0;
     computePublicStatusPayload.mockResolvedValue({
@@ -181,18 +181,17 @@ describe('public homepage downgrade guard', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({
-      generated_at: 190,
-      bootstrap_mode: 'partial',
-      overall_status: 'up',
+      generated_at: 260,
+      overall_status: 'unknown',
       banner: {
-        status: 'operational',
+        status: 'unknown',
       },
       summary: {
-        unknown: 0,
+        unknown: 40,
       },
     });
     expect(computePublicStatusPayload).toHaveBeenCalledOnce();
-    expect(statusSnapshotWrites).toBe(0);
+    expect(statusSnapshotWrites).toBe(1);
   });
 
   it('still upgrades to computed homepage data when the live status payload is healthy', async () => {

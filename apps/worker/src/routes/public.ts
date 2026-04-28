@@ -34,21 +34,28 @@ import {
   writeStatusSnapshot,
 } from '../snapshots';
 
-import { AppError } from '../middleware/errors';
+import { AppError, handleError, handleNotFound } from '../middleware/errors';
 import { cachePublic } from '../middleware/cache-public';
+import { Trace, applyTraceToResponse, resolveTraceOptions } from '../observability/trace';
 
 type PublicStatusSnapshotRow = {
   generated_at: number;
   body_json: string;
 };
 
-const HOMEPAGE_UNKNOWN_DOWNGRADE_GUARD_SECONDS = 2 * 60;
-
 function safeJsonParse(text: string): unknown | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
   try {
     return JSON.parse(trimmed) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function safeToSnapshotPayload(data: unknown) {
+  try {
+    return toSnapshotPayload(data);
   } catch {
     return null;
   }
@@ -61,7 +68,7 @@ function isAuthorizedStatusAdminRequest(c: {
   return hasValidAdminTokenRequest(c);
 }
 
-function applyPrivateNoStore(res: Response): Response {
+function appendAuthorizationVary(res: Response): Response {
   const vary = res.headers.get('Vary');
   if (!vary) {
     res.headers.set('Vary', 'Authorization');
@@ -69,58 +76,17 @@ function applyPrivateNoStore(res: Response): Response {
     res.headers.set('Vary', `${vary}, Authorization`);
   }
 
+  return res;
+}
+
+function applyPrivateNoStore(res: Response): Response {
+  appendAuthorizationVary(res);
   res.headers.set('Cache-Control', 'private, no-store');
   return res;
 }
 
 function withVisibilityAwareCaching(res: Response, includeHiddenMonitors: boolean): Response {
-  return includeHiddenMonitors ? applyPrivateNoStore(res) : res;
-}
-
-function shouldPreferRecentHomepageArtifact(opts: {
-  artifact:
-    | {
-        age: number;
-        data: {
-          snapshot: {
-            overall_status: string;
-            banner: { status: string };
-            summary: { unknown: number };
-          };
-        };
-      }
-    | null;
-  computed: {
-    overall_status: string;
-    banner: { status: string };
-    summary: { unknown: number };
-  };
-}): boolean {
-  const { artifact, computed } = opts;
-  if (!artifact) return false;
-
-  const snapshot = artifact.data.snapshot;
-  if (artifact.age > HOMEPAGE_UNKNOWN_DOWNGRADE_GUARD_SECONDS) {
-    return false;
-  }
-
-  const computedShowsUnknownLead =
-    computed.overall_status === 'unknown' || computed.banner.status === 'unknown';
-  if (!computedShowsUnknownLead) {
-    return false;
-  }
-
-  const artifactShowsKnownLead =
-    snapshot.overall_status !== 'unknown' || snapshot.banner.status !== 'unknown';
-  if (!artifactShowsKnownLead) {
-    return false;
-  }
-
-  return (
-    computed.summary.unknown > snapshot.summary.unknown ||
-    computed.overall_status !== snapshot.overall_status ||
-    computed.banner.status !== snapshot.banner.status
-  );
+  return includeHiddenMonitors ? applyPrivateNoStore(res) : appendAuthorizationVary(res);
 }
 
 async function readStaleStatusSnapshot(
@@ -140,6 +106,7 @@ async function readStaleStatusSnapshot(
       .first<PublicStatusSnapshotRow>();
 
     if (!row) return null;
+    if (row.generated_at > now + 60) return null;
 
     const age = Math.max(0, now - row.generated_at);
     if (age > maxStaleSeconds) return null;
@@ -154,6 +121,8 @@ async function readStaleStatusSnapshot(
 }
 
 export const publicRoutes = new Hono<{ Bindings: Env }>();
+publicRoutes.onError(handleError);
+publicRoutes.notFound(handleNotFound);
 
 // Cache public endpoints at the edge to improve performance on slow networks.
 publicRoutes.use(
@@ -161,6 +130,16 @@ publicRoutes.use(
   cachePublic({
     cacheName: 'uptimer-public',
     maxAgeSeconds: 30,
+    // Cache API lookups can be CPU-expensive on Cloudflare. The homepage
+    // endpoints already have their own caching layers (Pages HTML cache +
+    // public snapshot freshness), so skipping the shared edge cache reduces
+    // median CPU without changing the user-visible payload.
+    skipPathnames: [
+      '/homepage',
+      '/homepage-artifact',
+      '/api/v1/public/homepage',
+      '/api/v1/public/homepage-artifact',
+    ],
   }),
 );
 
@@ -339,13 +318,6 @@ function rangeToSeconds(
   }
 }
 
-function p95(values: number[]): number | null {
-  if (values.length === 0) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const idx = Math.max(0, Math.min(sorted.length - 1, Math.ceil(0.95 * sorted.length) - 1));
-  return sorted[idx] ?? null;
-}
-
 type IncidentRow = {
   id: number;
   title: string;
@@ -367,6 +339,11 @@ type IncidentUpdateRow = {
 type IncidentMonitorLinkRow = {
   incident_id: number;
   monitor_id: number;
+};
+
+type ResolvedIncidentCursorRow = {
+  id: number;
+  resolved_at: number | null;
 };
 
 function toIncidentStatus(
@@ -495,6 +472,11 @@ type MaintenanceWindowMonitorLinkRow = {
   monitor_id: number;
 };
 
+type MaintenanceHistoryCursorRow = {
+  id: number;
+  ends_at: number;
+};
+
 function maintenanceWindowRowToApi(row: MaintenanceWindowRow, monitorIds: number[] = []) {
   return {
     id: row.id,
@@ -536,27 +518,406 @@ async function listMaintenanceWindowMonitorIdsByWindowId(
   return byWindow;
 }
 
+function jsonNumberLiteral(value: number | null | undefined): string {
+  return typeof value === 'number' && Number.isFinite(value) ? String(Math.round(value)) : 'null';
+}
+
+function jsonArrayLiteral(value: string | null | undefined): string {
+  if (typeof value !== 'string') return '[]';
+  const trimmed = value.trim();
+  return trimmed.startsWith('[') && trimmed.endsWith(']') ? trimmed : '[]';
+}
+
+async function buildLatencyResponseJson(opts: {
+  db: D1Database;
+  monitor: { id: number; name: string };
+  range: z.infer<typeof latencyRangeSchema>;
+  rangeStart: number;
+  rangeEnd: number;
+}): Promise<string> {
+  const row = await opts.db
+    .prepare(
+      `
+        WITH ordered_points AS (
+          SELECT
+            checked_at,
+            CASE status
+              WHEN 'up' THEN 'up'
+              WHEN 'down' THEN 'down'
+              WHEN 'maintenance' THEN 'maintenance'
+              WHEN 'unknown' THEN 'unknown'
+              ELSE 'unknown'
+            END AS status,
+            latency_ms
+          FROM check_results
+          WHERE monitor_id = ?1
+            AND checked_at >= ?2
+            AND checked_at <= ?3
+          ORDER BY checked_at
+        ),
+        up_latencies AS (
+          SELECT
+            latency_ms,
+            row_number() OVER (ORDER BY latency_ms) AS rn,
+            count(*) OVER () AS cnt
+          FROM ordered_points
+          WHERE status = 'up'
+            AND latency_ms IS NOT NULL
+        )
+        SELECT
+          COALESCE(
+            (
+              SELECT json_group_array(
+                json_object(
+                  'checked_at', checked_at,
+                  'status', status,
+                  'latency_ms', latency_ms
+                )
+              )
+              FROM ordered_points
+            ),
+            '[]'
+          ) AS points_json,
+          CAST(round((SELECT avg(latency_ms) FROM up_latencies)) AS INTEGER) AS avg_latency_ms,
+          (
+            SELECT latency_ms
+            FROM up_latencies
+            WHERE rn = ((95 * cnt + 99) / 100)
+            LIMIT 1
+          ) AS p95_latency_ms
+      `,
+    )
+    .bind(opts.monitor.id, opts.rangeStart, opts.rangeEnd)
+    .first<{
+      points_json: string | null;
+      avg_latency_ms: number | null;
+      p95_latency_ms: number | null;
+    }>();
+
+  const monitorJson = JSON.stringify({
+    id: opts.monitor.id,
+    name: opts.monitor.name,
+  });
+
+  return `{"monitor":${monitorJson},"range":"${opts.range}","range_start_at":${opts.rangeStart},"range_end_at":${opts.rangeEnd},"avg_latency_ms":${jsonNumberLiteral(row?.avg_latency_ms)},"p95_latency_ms":${jsonNumberLiteral(row?.p95_latency_ms)},"points":${jsonArrayLiteral(row?.points_json)}}`;
+}
+
+async function resolveUptimeRangeStartFromDb(opts: {
+  db: D1Database;
+  monitorId: number;
+  rangeStart: number;
+  rangeEnd: number;
+  monitorCreatedAt: number;
+  lastCheckedAt: number | null;
+}): Promise<number | null> {
+  const monitorRangeStart = Math.max(opts.rangeStart, opts.monitorCreatedAt);
+  if (opts.rangeEnd <= monitorRangeStart) return null;
+
+  if (monitorRangeStart > opts.rangeStart) {
+    const firstCheck = await opts.db
+      .prepare(
+        `
+          SELECT checked_at
+          FROM check_results
+          WHERE monitor_id = ?1
+            AND checked_at >= ?2
+            AND checked_at < ?3
+          ORDER BY checked_at
+          LIMIT 1
+        `,
+      )
+      .bind(opts.monitorId, monitorRangeStart, opts.rangeEnd)
+      .first<{ checked_at: number }>();
+
+    if (typeof firstCheck?.checked_at === 'number') {
+      return firstCheck.checked_at;
+    }
+
+    return opts.lastCheckedAt === null ? null : monitorRangeStart;
+  }
+
+  return monitorRangeStart;
+}
+
+function addUptimeTotals(
+  target: { total_sec: number; downtime_sec: number; unknown_sec: number; uptime_sec: number },
+  source: { total_sec: number; downtime_sec: number; unknown_sec: number; uptime_sec: number },
+): void {
+  target.total_sec += source.total_sec;
+  target.downtime_sec += source.downtime_sec;
+  target.unknown_sec += source.unknown_sec;
+  target.uptime_sec += source.uptime_sec;
+}
+
+async function computeUptimeWindowTotalsFromRollups(opts: {
+  db: D1Database;
+  monitor: {
+    id: number;
+    interval_sec: number;
+    created_at: number;
+    last_checked_at: number | null;
+  };
+  rangeStart: number;
+  rangeEnd: number;
+}): Promise<{ total_sec: number; downtime_sec: number; unknown_sec: number; uptime_sec: number }> {
+  const totals = {
+    total_sec: 0,
+    downtime_sec: 0,
+    unknown_sec: 0,
+    uptime_sec: 0,
+  };
+  if (opts.rangeEnd <= opts.rangeStart) {
+    return totals;
+  }
+
+  const startDay = Math.floor(opts.rangeStart / 86400) * 86400;
+  const endDay = Math.floor(opts.rangeEnd / 86400) * 86400;
+
+  if (startDay === endDay) {
+    return computePartialUptimeTotals(
+      opts.db,
+      opts.monitor.id,
+      opts.monitor.interval_sec,
+      opts.monitor.created_at,
+      opts.monitor.last_checked_at,
+      opts.rangeStart,
+      opts.rangeEnd,
+    );
+  }
+
+  const startPartialEnd = Math.min(opts.rangeEnd, startDay + 86400);
+  if (opts.rangeStart < startPartialEnd) {
+    addUptimeTotals(
+      totals,
+      await computePartialUptimeTotals(
+        opts.db,
+        opts.monitor.id,
+        opts.monitor.interval_sec,
+        opts.monitor.created_at,
+        opts.monitor.last_checked_at,
+        opts.rangeStart,
+        startPartialEnd,
+      ),
+    );
+  }
+
+  const fullDaysStart = Math.max(startDay + 86400, opts.rangeStart);
+  const fullDaysEnd = endDay;
+  if (fullDaysStart < fullDaysEnd) {
+    const rollup = await opts.db
+      .prepare(
+        `
+          SELECT
+            SUM(total_sec) AS total_sec,
+            SUM(downtime_sec) AS downtime_sec,
+            SUM(unknown_sec) AS unknown_sec,
+            SUM(uptime_sec) AS uptime_sec
+          FROM monitor_daily_rollups
+          WHERE monitor_id = ?1
+            AND day_start_at >= ?2
+            AND day_start_at < ?3
+        `,
+      )
+      .bind(opts.monitor.id, fullDaysStart, fullDaysEnd)
+      .first<{
+        total_sec: number | null;
+        downtime_sec: number | null;
+        unknown_sec: number | null;
+        uptime_sec: number | null;
+      }>();
+
+    addUptimeTotals(totals, {
+      total_sec: rollup?.total_sec ?? 0,
+      downtime_sec: rollup?.downtime_sec ?? 0,
+      unknown_sec: rollup?.unknown_sec ?? 0,
+      uptime_sec: rollup?.uptime_sec ?? 0,
+    });
+  }
+
+  if (endDay < opts.rangeEnd) {
+    addUptimeTotals(
+      totals,
+      await computePartialUptimeTotals(
+        opts.db,
+        opts.monitor.id,
+        opts.monitor.interval_sec,
+        opts.monitor.created_at,
+        opts.monitor.last_checked_at,
+        endDay,
+        opts.rangeEnd,
+      ),
+    );
+  }
+
+  return totals;
+}
+
+async function listPublicMaintenanceWindowsPage(opts: {
+  db: D1Database;
+  now: number;
+  limit: number;
+  cursor: number | undefined;
+  includeHiddenMonitors: boolean;
+}): Promise<{
+  maintenance_windows: Array<ReturnType<typeof maintenanceWindowRowToApi>>;
+  next_cursor: number | null;
+}> {
+  const limitPlusOne = opts.limit + 1;
+  const batchLimit = Math.max(50, limitPlusOne);
+  const maintenanceCursorVisibilitySql = maintenanceWindowStatusPageVisibilityPredicate(
+    opts.includeHiddenMonitors,
+  );
+  let seekCursor: MaintenanceHistoryCursorRow | null = null;
+  if (opts.cursor !== undefined) {
+    const cursorRow = await opts.db
+      .prepare(
+        `
+          SELECT id, ends_at
+          FROM maintenance_windows
+          WHERE id = ?1
+            AND ends_at <= ?2
+            AND ${maintenanceCursorVisibilitySql}
+        `,
+      )
+      .bind(opts.cursor, opts.now)
+      .first<MaintenanceHistoryCursorRow>();
+
+    if (!cursorRow || typeof cursorRow.ends_at !== 'number') {
+      return {
+        maintenance_windows: [],
+        next_cursor: null,
+      };
+    }
+
+    seekCursor = cursorRow;
+  }
+  const collected: Array<{ row: MaintenanceWindowRow; monitorIds: number[] }> = [];
+
+  while (collected.length < limitPlusOne) {
+    const { results: windowRows } = seekCursor
+      ? await opts.db
+          .prepare(
+            `
+              SELECT id, title, message, starts_at, ends_at, created_at
+              FROM maintenance_windows
+              WHERE ends_at <= ?1
+                AND (ends_at < ?3 OR (ends_at = ?3 AND id < ?4))
+              ORDER BY ends_at DESC, id DESC
+              LIMIT ?2
+            `,
+          )
+          .bind(opts.now, batchLimit, seekCursor.ends_at, seekCursor.id)
+          .all<MaintenanceWindowRow>()
+      : await opts.db
+          .prepare(
+            `
+              SELECT id, title, message, starts_at, ends_at, created_at
+              FROM maintenance_windows
+              WHERE ends_at <= ?1
+              ORDER BY ends_at DESC, id DESC
+              LIMIT ?2
+            `,
+          )
+          .bind(opts.now, batchLimit)
+          .all<MaintenanceWindowRow>();
+
+    const allWindows = windowRows ?? [];
+    if (allWindows.length === 0) {
+      break;
+    }
+
+    const monitorIdsByWindowId = await listMaintenanceWindowMonitorIdsByWindowId(
+      opts.db,
+      allWindows.map((window) => window.id),
+    );
+    const linkedMonitorIds = [...monitorIdsByWindowId.values()].flat();
+    const visibleMonitorIds =
+      opts.includeHiddenMonitors || linkedMonitorIds.length === 0
+        ? new Set<number>()
+        : await listStatusPageVisibleMonitorIds(opts.db, linkedMonitorIds);
+
+    for (const row of allWindows) {
+      const originalMonitorIds = monitorIdsByWindowId.get(row.id) ?? [];
+      const filteredMonitorIds = filterStatusPageScopedMonitorIds(
+        originalMonitorIds,
+        visibleMonitorIds,
+        opts.includeHiddenMonitors,
+      );
+      if (!shouldIncludeStatusPageScopedItem(originalMonitorIds, filteredMonitorIds)) {
+        continue;
+      }
+      collected.push({ row, monitorIds: filteredMonitorIds });
+      if (collected.length >= limitPlusOne) {
+        break;
+      }
+    }
+
+    const lastRow = allWindows[allWindows.length - 1];
+    if (allWindows.length < batchLimit || !lastRow) {
+      break;
+    }
+    seekCursor = {
+      id: lastRow.id,
+      ends_at: lastRow.ends_at,
+    };
+  }
+
+  const maintenanceWindows = collected
+    .slice(0, opts.limit)
+    .map(({ row, monitorIds }) => maintenanceWindowRowToApi(row, monitorIds));
+  const next_cursor =
+    collected.length > opts.limit
+      ? (collected[opts.limit - 1]?.row.id ?? null)
+      : null;
+
+  return {
+    maintenance_windows: maintenanceWindows,
+    next_cursor,
+  };
+}
+
 publicRoutes.get('/status', async (c) => {
   const now = Math.floor(Date.now() / 1000);
   const includeHiddenMonitors = isAuthorizedStatusAdminRequest(c);
+  const trace = new Trace(
+    resolveTraceOptions({
+      header: (name) => c.req.header(name),
+      env: c.env as unknown as Record<string, unknown>,
+    }),
+  );
+  trace.setLabel('route', 'public/status');
+  trace.setLabel('hidden', includeHiddenMonitors);
 
   if (includeHiddenMonitors) {
-    const payload = await computePublicStatusPayload(c.env.DB, now, {
+    const payload = await trace.timeAsync('status_compute', () =>
+      computePublicStatusPayload(c.env.DB, now, {
       includeHiddenMonitors: true,
-    });
-    return applyPrivateNoStore(c.json(payload));
+      }),
+    );
+    const res = applyPrivateNoStore(c.json(payload));
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
+    return res;
   }
 
-  const snapshot = await readStatusSnapshotJson(c.env.DB, now);
+  const snapshot = await trace.timeAsync('status_snapshot_read', () =>
+    readStatusSnapshotJson(c.env.DB, now),
+  );
   if (snapshot) {
     c.header('Content-Type', 'application/json; charset=utf-8');
-    const res = c.body(snapshot.bodyJson);
+    const res = withVisibilityAwareCaching(c.body(snapshot.bodyJson), includeHiddenMonitors);
     applyStatusCacheHeaders(res, snapshot.age);
+    trace.setLabel('path', 'snapshot');
+    trace.setLabel('age', snapshot.age);
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   }
   try {
-    const payload = await computePublicStatusPayload(c.env.DB, now);
-    const res = c.json(payload);
+    const payload = await trace.timeAsync('status_compute', () =>
+      computePublicStatusPayload(c.env.DB, now),
+    );
+    const res = withVisibilityAwareCaching(c.json(payload), includeHiddenMonitors);
     applyStatusCacheHeaders(res, 0);
 
     c.executionCtx.waitUntil(
@@ -565,6 +926,9 @@ publicRoutes.get('/status', async (c) => {
       }),
     );
 
+    trace.setLabel('path', 'compute');
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   } catch (err) {
     console.warn('public status: compute failed', err);
@@ -573,9 +937,16 @@ publicRoutes.get('/status', async (c) => {
     // instead of failing the entire status page.
     const stale = await readStaleStatusSnapshot(c.env.DB, now, 10 * 60);
     if (stale) {
-      const res = c.json(toSnapshotPayload(stale.data));
-      applyStatusCacheHeaders(res, Math.min(60, stale.age));
-      return res;
+      const payload = safeToSnapshotPayload(stale.data);
+      if (payload) {
+        const res = withVisibilityAwareCaching(c.json(payload), includeHiddenMonitors);
+        applyStatusCacheHeaders(res, Math.min(60, stale.age));
+        trace.setLabel('path', 'stale');
+        trace.setLabel('age', stale.age);
+        trace.finish('total');
+        applyTraceToResponse({ res, trace, prefix: 'w' });
+        return res;
+      }
     }
 
     throw err;
@@ -584,11 +955,24 @@ publicRoutes.get('/status', async (c) => {
 
 publicRoutes.get('/homepage', async (c) => {
   const now = Math.floor(Date.now() / 1000);
-  const snapshot = await readHomepageSnapshotJson(c.env.DB, now);
+  const trace = new Trace(
+    resolveTraceOptions({
+      header: (name) => c.req.header(name),
+      env: c.env as unknown as Record<string, unknown>,
+    }),
+  );
+  trace.setLabel('route', 'public/homepage');
+  const snapshot = await trace.timeAsync('homepage_snapshot_read', () =>
+    readHomepageSnapshotJson(c.env.DB, now),
+  );
   if (snapshot) {
     c.header('Content-Type', 'application/json; charset=utf-8');
     const res = c.body(snapshot.bodyJson);
     applyHomepageCacheHeaders(res, snapshot.age);
+    trace.setLabel('path', 'snapshot');
+    trace.setLabel('age', snapshot.age);
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   }
 
@@ -599,32 +983,32 @@ publicRoutes.get('/homepage', async (c) => {
       maintenanceHistoryPreview: null,
     };
   });
-  const statusSnapshot = await readStatusSnapshot(c.env.DB, now);
+  const statusSnapshot = await trace.timeAsync('status_snapshot_read', () =>
+    readStatusSnapshot(c.env.DB, now),
+  );
   if (statusSnapshot) {
-    const payload = homepageFromStatusPayload(
-      statusSnapshot.data,
-      await historyPreviewsPromise,
+    const previews = await trace.timeAsync('homepage_previews', () => historyPreviewsPromise);
+    const payload = trace.time('homepage_compose', () =>
+      homepageFromStatusPayload(statusSnapshot.data, previews),
     );
     const res = c.json(payload);
     applyHomepageCacheHeaders(res, statusSnapshot.age);
+    trace.setLabel('path', 'status_snapshot');
+    trace.setLabel('age', statusSnapshot.age);
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   }
 
-  const artifactSnapshotPromise = readStaleHomepageSnapshotArtifact(c.env.DB, now);
-
   try {
-    const statusPayload = await computePublicStatusPayload(c.env.DB, now);
-    const artifactSnapshot = await artifactSnapshotPromise;
-    if (
-      artifactSnapshot &&
-      shouldPreferRecentHomepageArtifact({ artifact: artifactSnapshot, computed: statusPayload })
-    ) {
-      const res = c.json(artifactSnapshot.data.snapshot);
-      applyHomepageCacheHeaders(res, Math.min(60, artifactSnapshot.age));
-      return res;
-    }
+    const statusPayload = await trace.timeAsync('status_compute', () =>
+      computePublicStatusPayload(c.env.DB, now),
+    );
 
-    const payload = homepageFromStatusPayload(statusPayload, await historyPreviewsPromise);
+    const previews = await trace.timeAsync('homepage_previews', () => historyPreviewsPromise);
+    const payload = trace.time('homepage_compose', () =>
+      homepageFromStatusPayload(statusPayload, previews),
+    );
     const res = c.json(payload);
     applyHomepageCacheHeaders(res, 0);
 
@@ -634,35 +1018,60 @@ publicRoutes.get('/homepage', async (c) => {
       }),
     );
 
+    trace.setLabel('path', 'compute');
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   } catch (err) {
     console.warn('public homepage: secondary status compute failed', err);
 
-    const staleHomepage = await readStaleHomepageSnapshot(c.env.DB, now);
+    const staleHomepage = await trace.timeAsync('homepage_snapshot_stale_read', () =>
+      readStaleHomepageSnapshot(c.env.DB, now),
+    );
     if (staleHomepage) {
       const res = c.json(staleHomepage.data);
       applyHomepageCacheHeaders(res, Math.min(60, staleHomepage.age));
+      trace.setLabel('path', 'stale_homepage');
+      trace.setLabel('age', staleHomepage.age);
+      trace.finish('total');
+      applyTraceToResponse({ res, trace, prefix: 'w' });
       return res;
     }
 
-    const staleStatus = await readStaleStatusSnapshot(c.env.DB, now, 10 * 60);
+    const staleStatus = await trace.timeAsync('status_snapshot_stale_read', () =>
+      readStaleStatusSnapshot(c.env.DB, now, 10 * 60),
+    );
     if (staleStatus) {
-      const payload = homepageFromStatusPayload(
-        toSnapshotPayload(staleStatus.data),
-        await historyPreviewsPromise.catch(() => ({
-          resolvedIncidentPreview: null,
-          maintenanceHistoryPreview: null,
-        })),
-      );
-      const res = c.json(payload);
-      applyHomepageCacheHeaders(res, Math.min(60, staleStatus.age));
-      return res;
+      const staleStatusPayload = safeToSnapshotPayload(staleStatus.data);
+      if (staleStatusPayload) {
+        const payload = homepageFromStatusPayload(
+          staleStatusPayload,
+          await historyPreviewsPromise.catch(() => ({
+            resolvedIncidentPreview: null,
+            maintenanceHistoryPreview: null,
+          })),
+        );
+        const res = c.json(payload);
+        applyHomepageCacheHeaders(res, Math.min(60, staleStatus.age));
+        trace.setLabel('path', 'stale_status');
+        trace.setLabel('age', staleStatus.age);
+        trace.finish('total');
+        applyTraceToResponse({ res, trace, prefix: 'w' });
+        return res;
+      }
+      console.warn('public homepage: stale status snapshot invalid');
     }
 
-    const staleArtifact = await artifactSnapshotPromise;
+    const staleArtifact = await trace.timeAsync('homepage_artifact_stale_read', () =>
+      readStaleHomepageSnapshotArtifact(c.env.DB, now),
+    );
     if (staleArtifact) {
       const res = c.json(staleArtifact.data.snapshot);
       applyHomepageCacheHeaders(res, Math.min(60, staleArtifact.age));
+      trace.setLabel('path', 'stale_artifact');
+      trace.setLabel('age', staleArtifact.age);
+      trace.finish('total');
+      applyTraceToResponse({ res, trace, prefix: 'w' });
       return res;
     }
 
@@ -672,19 +1081,40 @@ publicRoutes.get('/homepage', async (c) => {
 
 publicRoutes.get('/homepage-artifact', async (c) => {
   const now = Math.floor(Date.now() / 1000);
-  const snapshot = await readHomepageSnapshotArtifactJson(c.env.DB, now);
+  const trace = new Trace(
+    resolveTraceOptions({
+      header: (name) => c.req.header(name),
+      env: c.env as unknown as Record<string, unknown>,
+    }),
+  );
+  trace.setLabel('route', 'public/homepage-artifact');
+  const snapshot = await trace.timeAsync('homepage_artifact_read', () =>
+    readHomepageSnapshotArtifactJson(c.env.DB, now),
+  );
   if (snapshot) {
     c.header('Content-Type', 'application/json; charset=utf-8');
     const res = c.body(snapshot.bodyJson);
     applyHomepageCacheHeaders(res, snapshot.age);
+    trace.setLabel('path', 'snapshot');
+    trace.setLabel('age', snapshot.age);
+    trace.setLabel('bytes', snapshot.bodyJson.length);
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   }
 
-  const stale = await readStaleHomepageSnapshotArtifactJson(c.env.DB, now);
+  const stale = await trace.timeAsync('homepage_artifact_stale_read', () =>
+    readStaleHomepageSnapshotArtifactJson(c.env.DB, now),
+  );
   if (stale) {
     c.header('Content-Type', 'application/json; charset=utf-8');
     const res = c.body(stale.bodyJson);
     applyHomepageCacheHeaders(res, Math.min(60, stale.age));
+    trace.setLabel('path', 'stale');
+    trace.setLabel('age', stale.age);
+    trace.setLabel('bytes', stale.bodyJson.length);
+    trace.finish('total');
+    applyTraceToResponse({ res, trace, prefix: 'w' });
     return res;
   }
 
@@ -742,44 +1172,73 @@ publicRoutes.get('/incidents', async (c) => {
       SELECT id, title, status, impact, message, started_at, resolved_at
       FROM incidents
       WHERE status = 'resolved'
+        AND resolved_at IS NOT NULL
         AND ${incidentVisibilitySql}
     `;
 
     const resolvedLimitPlusOne = remaining + 1;
     const batchLimit = Math.max(50, resolvedLimitPlusOne);
-    let seekCursor = cursor;
     const collected: IncidentRow[] = [];
+    const initialCursor =
+      cursor === undefined
+        ? null
+        : await c.env.DB
+            .prepare(
+              `
+                SELECT id, resolved_at
+                FROM incidents
+                WHERE id = ?1
+                  AND status = 'resolved'
+                  AND resolved_at IS NOT NULL
+                  AND ${incidentVisibilitySql}
+              `,
+            )
+            .bind(cursor)
+            .first<ResolvedIncidentCursorRow>();
 
-    while (collected.length < resolvedLimitPlusOne) {
-      const { results: resolvedRows } = seekCursor
-        ? await c.env.DB.prepare(
-            `
-              ${baseSql}
-                AND id < ?2
-              ORDER BY id DESC
-              LIMIT ?1
-            `,
-          )
-            .bind(batchLimit, seekCursor)
-            .all<IncidentRow>()
-        : await c.env.DB.prepare(
-            `
-              ${baseSql}
-              ORDER BY id DESC
-              LIMIT ?1
-            `,
-          )
-            .bind(batchLimit)
-            .all<IncidentRow>();
+    if (cursor === undefined || initialCursor) {
+      let seekCursor = initialCursor;
 
-      const allResolved = resolvedRows ?? [];
-      if (allResolved.length === 0) break;
+      while (collected.length < resolvedLimitPlusOne) {
+        const { results: resolvedRows } = seekCursor
+          ? await c.env.DB.prepare(
+              `
+                ${baseSql}
+                  AND (resolved_at < ?2 OR (resolved_at = ?2 AND id < ?3))
+                ORDER BY resolved_at DESC, id DESC
+                LIMIT ?1
+              `,
+            )
+              .bind(batchLimit, seekCursor.resolved_at, seekCursor.id)
+              .all<IncidentRow>()
+          : await c.env.DB.prepare(
+              `
+                ${baseSql}
+                ORDER BY resolved_at DESC, id DESC
+                LIMIT ?1
+              `,
+            )
+              .bind(batchLimit)
+              .all<IncidentRow>();
 
-      collected.push(...allResolved);
+        const allResolved = resolvedRows ?? [];
+        if (allResolved.length === 0) break;
 
-      const lastRow = allResolved[allResolved.length - 1];
-      if (allResolved.length < batchLimit || !lastRow) break;
-      seekCursor = lastRow.id;
+        collected.push(...allResolved);
+
+        const lastRow = allResolved[allResolved.length - 1];
+        if (
+          allResolved.length < batchLimit ||
+          !lastRow ||
+          typeof lastRow.resolved_at !== 'number'
+        ) {
+          break;
+        }
+        seekCursor = {
+          id: lastRow.id,
+          resolved_at: lastRow.resolved_at,
+        };
+      }
     }
 
     resolved = collected.slice(0, remaining);
@@ -835,82 +1294,17 @@ publicRoutes.get('/maintenance-windows', async (c) => {
   const cursor = z.coerce.number().int().positive().optional().parse(c.req.query('cursor'));
 
   const now = Math.floor(Date.now() / 1000);
-  const maintenanceVisibilitySql = maintenanceWindowStatusPageVisibilityPredicate(
-    includeHiddenMonitors,
-  );
-  const baseSql = `
-    SELECT id, title, message, starts_at, ends_at, created_at
-    FROM maintenance_windows
-    WHERE ends_at <= ?1
-      AND ${maintenanceVisibilitySql}
-  `;
-  const limitPlusOne = limit + 1;
-  const batchLimit = Math.max(50, limitPlusOne);
-  let seekCursor = cursor;
-  const collected: MaintenanceWindowRow[] = [];
-
-  while (collected.length < limitPlusOne) {
-    const { results: windowRows } = seekCursor
-      ? await c.env.DB.prepare(
-          `
-            ${baseSql}
-              AND id < ?3
-            ORDER BY id DESC
-            LIMIT ?2
-          `,
-        )
-          .bind(now, batchLimit, seekCursor)
-          .all<MaintenanceWindowRow>()
-      : await c.env.DB.prepare(
-          `
-            ${baseSql}
-            ORDER BY id DESC
-            LIMIT ?2
-          `,
-        )
-          .bind(now, batchLimit)
-          .all<MaintenanceWindowRow>();
-
-    const allWindows = windowRows ?? [];
-    if (allWindows.length === 0) break;
-
-    collected.push(...allWindows);
-
-    const lastRow = allWindows[allWindows.length - 1];
-    if (allWindows.length < batchLimit || !lastRow) break;
-    seekCursor = lastRow.id;
-  }
-
-  const windows = collected.slice(0, limit);
-  const next_cursor = collected.length > limit ? (windows[windows.length - 1]?.id ?? null) : null;
-
-  const monitorIdsByWindowId = await listMaintenanceWindowMonitorIdsByWindowId(
-    c.env.DB,
-    windows.map((w) => w.id),
-  );
-
-  const visibleMonitorIds = includeHiddenMonitors
-    ? new Set<number>()
-    : await listStatusPageVisibleMonitorIds(c.env.DB, [...monitorIdsByWindowId.values()].flat());
 
   return withVisibilityAwareCaching(
-    c.json({
-      maintenance_windows: windows.flatMap((w) => {
-        const originalMonitorIds = monitorIdsByWindowId.get(w.id) ?? [];
-        const filteredMonitorIds = filterStatusPageScopedMonitorIds(
-          originalMonitorIds,
-          visibleMonitorIds,
-          includeHiddenMonitors,
-        );
-
-        if (!shouldIncludeStatusPageScopedItem(originalMonitorIds, filteredMonitorIds)) {
-          return [];
-        }
-
-        return [maintenanceWindowRowToApi(w, filteredMonitorIds)];
+    c.json(
+      await listPublicMaintenanceWindowsPage({
+        db: c.env.DB,
+        now,
+        limit,
+        cursor,
+        includeHiddenMonitors,
       }),
-      next_cursor,
-    }),
+    ),
     includeHiddenMonitors,
   );
 });
@@ -952,10 +1346,6 @@ publicRoutes.get('/monitors/:id/day-context', async (c) => {
     .all<MaintenanceWindowRow>();
 
   const maintenance = maintenanceRows ?? [];
-  const monitorIdsByWindowId = await listMaintenanceWindowMonitorIdsByWindowId(
-    c.env.DB,
-    maintenance.map((w) => w.id),
-  );
 
   const { results: incidentRows } = await c.env.DB.prepare(
     `
@@ -973,21 +1363,47 @@ publicRoutes.get('/monitors/:id/day-context', async (c) => {
     .all<IncidentRow>();
 
   const incidents = incidentRows ?? [];
-  const updatesByIncidentId = await listIncidentUpdatesByIncidentId(
-    c.env.DB,
-    incidents.map((r) => r.id),
-  );
-  const monitorIdsByIncidentId = await listIncidentMonitorIdsByIncidentId(
-    c.env.DB,
-    incidents.map((r) => r.id),
-  );
+  if (maintenance.length === 0 && incidents.length === 0) {
+    return withVisibilityAwareCaching(
+      c.json({
+        day_start_at: dayStartAt,
+        day_end_at: dayEndAt,
+        maintenance_windows: [],
+        incidents: [],
+      }),
+      includeHiddenMonitors,
+    );
+  }
+
+  const [monitorIdsByWindowId, updatesByIncidentId, monitorIdsByIncidentId] = await Promise.all([
+    maintenance.length > 0
+      ? listMaintenanceWindowMonitorIdsByWindowId(
+          c.env.DB,
+          maintenance.map((w) => w.id),
+        )
+      : Promise.resolve(new Map<number, number[]>()),
+    incidents.length > 0
+      ? listIncidentUpdatesByIncidentId(
+          c.env.DB,
+          incidents.map((r) => r.id),
+        )
+      : Promise.resolve(new Map<number, IncidentUpdateRow[]>()),
+    incidents.length > 0
+      ? listIncidentMonitorIdsByIncidentId(
+          c.env.DB,
+          incidents.map((r) => r.id),
+        )
+      : Promise.resolve(new Map<number, number[]>()),
+  ]);
 
   const visibleMonitorIds = includeHiddenMonitors
     ? new Set<number>()
-    : await listStatusPageVisibleMonitorIds(
-        c.env.DB,
-        [...monitorIdsByWindowId.values(), ...monitorIdsByIncidentId.values()].flat(),
-      );
+    : await (async () => {
+        const scopedMonitorIds = [...monitorIdsByWindowId.values(), ...monitorIdsByIncidentId.values()].flat();
+        return scopedMonitorIds.length === 0
+          ? new Set<number>()
+          : listStatusPageVisibleMonitorIds(c.env.DB, scopedMonitorIds);
+      })();
 
   return withVisibilityAwareCaching(
     c.json({
@@ -1049,50 +1465,19 @@ publicRoutes.get('/monitors/:id/latency', async (c) => {
   const now = Math.floor(Date.now() / 1000);
   const rangeEnd = Math.floor(now / 60) * 60;
   const rangeStart = rangeEnd - rangeToSeconds(range);
-
-  const { results } = await c.env.DB.prepare(
-    `
-      SELECT checked_at, status, latency_ms
-      FROM check_results
-      WHERE monitor_id = ?1
-        AND checked_at >= ?2
-        AND checked_at <= ?3
-      ORDER BY checked_at
-    `,
-  )
-    .bind(id, rangeStart, rangeEnd)
-    .all<{ checked_at: number; status: string; latency_ms: number | null }>();
-
-  const points = (results ?? []).map((r) => ({
-    checked_at: r.checked_at,
-    status: toCheckStatus(r.status),
-    latency_ms: r.latency_ms,
-  }));
-
-  const upLatencies = points
-    .filter((p) => p.status === 'up' && typeof p.latency_ms === 'number')
-    .map((p) => p.latency_ms as number);
-
-  const avg_latency_ms =
-    upLatencies.length === 0
-      ? null
-      : Math.round(upLatencies.reduce((acc, v) => acc + v, 0) / upLatencies.length);
-
-  return withVisibilityAwareCaching(
-    c.json({
-      monitor: { id: monitor.id, name: monitor.name },
-      range,
-      range_start_at: rangeStart,
-      range_end_at: rangeEnd,
-      avg_latency_ms,
-      p95_latency_ms: p95(upLatencies),
-      points,
-    }),
-    includeHiddenMonitors,
-  );
+  const bodyJson = await buildLatencyResponseJson({
+    db: c.env.DB,
+    monitor,
+    range,
+    rangeStart,
+    rangeEnd,
+  });
+  const res = new Response(bodyJson, {
+    status: 200,
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+  });
+  return withVisibilityAwareCaching(res, includeHiddenMonitors);
 });
-
-type OutageRow = { started_at: number; ended_at: number | null };
 
 function resolveUptimeRangeStart(
   rangeStart: number,
@@ -1150,32 +1535,14 @@ publicRoutes.get('/monitors/:id/uptime', async (c) => {
   const rangeEnd = Math.floor(now / 60) * 60;
   const requestedRangeStart = rangeEnd - rangeToSeconds(range);
   const rangeStart = Math.max(requestedRangeStart, monitor.created_at);
-
-  const checksStart = rangeStart - monitor.interval_sec * 2;
-  const { results: checkRows } = await c.env.DB.prepare(
-    `
-      SELECT checked_at, status
-      FROM check_results
-      WHERE monitor_id = ?1
-        AND checked_at >= ?2
-        AND checked_at < ?3
-      ORDER BY checked_at
-    `,
-  )
-    .bind(id, checksStart, rangeEnd)
-    .all<{ checked_at: number; status: string }>();
-
-  const checks = (checkRows ?? []).map((r) => ({
-    checked_at: r.checked_at,
-    status: toCheckStatus(r.status),
-  }));
-  const effectiveRangeStart = resolveUptimeRangeStart(
+  const effectiveRangeStart = await resolveUptimeRangeStartFromDb({
+    db: c.env.DB,
+    monitorId: id,
     rangeStart,
     rangeEnd,
-    monitor.created_at,
-    monitor.last_checked_at,
-    checks,
-  );
+    monitorCreatedAt: monitor.created_at,
+    lastCheckedAt: monitor.last_checked_at,
+  });
   const rangeStartAt = effectiveRangeStart ?? rangeStart;
   if (effectiveRangeStart === null || rangeEnd <= effectiveRangeStart) {
     return withVisibilityAwareCaching(
@@ -1194,50 +1561,18 @@ publicRoutes.get('/monitors/:id/uptime', async (c) => {
     );
   }
 
-  const total_sec = rangeEnd - effectiveRangeStart;
-  const { results: outageRows } = await c.env.DB.prepare(
-    `
-      SELECT started_at, ended_at
-      FROM outages
-      WHERE monitor_id = ?1
-        AND started_at < ?2
-        AND (ended_at IS NULL OR ended_at > ?3)
-      ORDER BY started_at
-    `,
-  )
-    .bind(id, rangeEnd, effectiveRangeStart)
-    .all<OutageRow>();
-
-  const downtimeIntervals = mergeIntervals(
-    (outageRows ?? [])
-      .map((r) => {
-        const start = Math.max(r.started_at, effectiveRangeStart);
-        const end = Math.min(r.ended_at ?? rangeEnd, rangeEnd);
-        return { start, end };
-      })
-      .filter((it) => it.end > it.start),
-  );
-  const downtime_sec = sumIntervals(downtimeIntervals);
-
-  const checksForUnknown =
-    effectiveRangeStart > rangeStart
-      ? checks.filter((check) => check.checked_at >= effectiveRangeStart)
-      : checks;
-  const unknownIntervals = buildUnknownIntervals(
-    effectiveRangeStart,
-    rangeEnd,
-    monitor.interval_sec,
-    checksForUnknown,
-  );
-
-  // Unknown time is treated as "unavailable" per Application.md; exclude overlap with downtime to avoid double counting.
-  const unknown_sec = Math.max(
-    0,
-    sumIntervals(unknownIntervals) - overlapSeconds(unknownIntervals, downtimeIntervals),
-  );
-
-  const unavailable_sec = Math.min(total_sec, downtime_sec + unknown_sec);
-  const uptime_sec = Math.max(0, total_sec - unavailable_sec);
+  const { total_sec, downtime_sec, unknown_sec, uptime_sec } =
+    await computeUptimeWindowTotalsFromRollups({
+      db: c.env.DB,
+      monitor: {
+        id: monitor.id,
+        interval_sec: monitor.interval_sec,
+        created_at: monitor.created_at,
+        last_checked_at: monitor.last_checked_at,
+      },
+      rangeStart: effectiveRangeStart,
+      rangeEnd,
+    });
   const uptime_pct = total_sec === 0 ? 0 : (uptime_sec / total_sec) * 100;
 
   return withVisibilityAwareCaching(
