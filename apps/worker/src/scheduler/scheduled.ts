@@ -699,7 +699,13 @@ async function runScheduledCheckBatchViaService(
         allow_notifications: context.allowNotifications || undefined,
       }),
     }),
-    INTERNAL_SCHEDULED_CHECK_BATCH_TIMEOUT_MS,
+    readBoundedPositiveIntegerEnv(
+      env,
+      'UPTIMER_INTERNAL_SCHEDULED_CHECK_BATCH_TIMEOUT_MS',
+      INTERNAL_SCHEDULED_CHECK_BATCH_TIMEOUT_MS,
+      5_000,
+      120_000,
+    ),
     'scheduled check batch service',
     signal,
   );
