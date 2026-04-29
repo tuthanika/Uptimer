@@ -120,6 +120,7 @@ type ScheduledCheckBatchServiceContext = {
   };
   allowNotifications: boolean;
   runtimeFragmentsOnly?: boolean;
+  splitRuntimeFragmentWrites?: boolean;
 };
 
 function readScheduledTraceToken(env: Env): string | null {
@@ -170,6 +171,11 @@ function shouldUseScheduledRuntimeFragmentPipeline(env: Env): boolean {
     shouldRefreshRuntimeFragmentsViaService(env) &&
     isTruthyEnvFlag(rawEnv.UPTIMER_PUBLIC_MONITOR_UPDATE_FRAGMENT_WRITES)
   );
+}
+
+function shouldSplitInternalCheckBatchFragmentWrites(env: Env): boolean {
+  const rawEnv = env as unknown as Record<string, unknown>;
+  return isTruthyEnvFlag(rawEnv.UPTIMER_INTERNAL_CHECK_BATCH_FRAGMENT_WRITE_SPLIT);
 }
 
 function shouldSeedScheduledShardedFragments(env: Env): boolean {
@@ -252,6 +258,40 @@ async function fetchSelfWithTimeout(
   } finally {
     signal?.removeEventListener('abort', abortFromParent);
     clearTimeout(timeout);
+  }
+}
+
+async function writeRuntimeUpdateFragmentsViaService(
+  env: Env,
+  runtimeUpdates: readonly MonitorRuntimeUpdate[],
+  signal?: AbortSignal,
+): Promise<void> {
+  if (runtimeUpdates.length === 0) {
+    return;
+  }
+  if (!env.ADMIN_TOKEN) {
+    throw new Error('ADMIN_TOKEN missing');
+  }
+
+  const res = await fetchSelfWithTimeout(
+    env,
+    new Request('http://internal/api/v1/internal/write/runtime-update-fragments', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.ADMIN_TOKEN}`,
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify({
+        runtime_updates: encodeMonitorRuntimeUpdatesCompact(runtimeUpdates),
+      }),
+    }),
+    RUNTIME_FRAGMENTS_REFRESH_SERVICE_TIMEOUT_MS,
+    'runtime update fragments write service',
+    signal,
+  );
+  const bodyText = await res.text().catch(() => '');
+  if (!res.ok) {
+    throw new Error(`runtime update fragments write failed: HTTP ${res.status} ${bodyText}`.trim());
   }
 }
 
@@ -668,11 +708,15 @@ async function runScheduledCheckBatchViaService(
 
   const traceScheduledRefresh = shouldTraceScheduledRefresh(env);
   const traceId = traceScheduledRefresh ? crypto.randomUUID() : null;
+  const returnRuntimeUpdatesForSplit =
+    context.runtimeFragmentsOnly === true && context.splitRuntimeFragmentWrites === true;
   const headers: Record<string, string> = {
     Authorization: `Bearer ${env.ADMIN_TOKEN}`,
     'X-Uptimer-Internal-Format': INTERNAL_PROTOCOL_FORMAT,
     'Content-Type': 'application/json; charset=utf-8',
-    ...(context.runtimeFragmentsOnly ? { 'X-Uptimer-Runtime-Fragments-Only': '1' } : {}),
+    ...(context.runtimeFragmentsOnly && !returnRuntimeUpdatesForSplit
+      ? { 'X-Uptimer-Runtime-Fragments-Only': '1' }
+      : {}),
   };
   if (traceScheduledRefresh) {
     headers['X-Uptimer-Trace'] = '1';
@@ -731,7 +775,16 @@ async function runScheduledCheckBatchViaService(
     }
   }
 
-  return toScheduledCheckBatchServiceResult(parsedBody);
+  const result = toScheduledCheckBatchServiceResult(parsedBody);
+  if (returnRuntimeUpdatesForSplit) {
+    await writeRuntimeUpdateFragmentsViaService(env, result.runtimeUpdates, signal);
+    return {
+      ...result,
+      runtimeUpdates: [],
+    };
+  }
+
+  return result;
 }
 
 type CachedMonitorHttpJson = {
@@ -1809,6 +1862,8 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
         ? chunkDueMonitorRows(due, internalScheduledBatchSize)
         : null;
     const activeRuntimeFragmentPipeline = useRuntimeFragmentPipeline && serviceBatchRows !== null;
+    const splitRuntimeFragmentWrites =
+      activeRuntimeFragmentPipeline && shouldSplitInternalCheckBatchFragmentWrites(env);
 
     const inlineNotificationHandler =
       notificationsModule && notify
@@ -1853,6 +1908,7 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
                 stateMachineConfig,
                 allowNotifications: Boolean(notify),
                 ...(activeRuntimeFragmentPipeline ? { runtimeFragmentsOnly: true } : {}),
+                ...(splitRuntimeFragmentWrites ? { splitRuntimeFragmentWrites: true } : {}),
               }, schedulerLease.signal);
             } catch (err) {
               schedulerLease.assertHeld('dispatching inline fallback for service batch');

@@ -200,6 +200,10 @@ const internalRefreshJsonBodySchema = z.object({
   runtime_updates: z.array(z.unknown()).optional(),
 });
 
+const internalRuntimeUpdateFragmentsWriteBodySchema = z.object({
+  runtime_updates: z.array(z.unknown()),
+});
+
 const internalShardedPublicSnapshotBodySchema = z.object({
   kind: z.enum(['homepage', 'status']),
   assembly: z.enum(['validated', 'json']).optional().default('validated'),
@@ -722,6 +726,58 @@ async function handleInternalShardedPublicSnapshotContinuation(
   );
 }
 
+async function handleInternalRuntimeUpdateFragmentsWrite(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (!isInternalServiceRequest(request)) {
+    return buildNotFoundJsonResponse(request.headers.get('Origin'));
+  }
+  if (request.method !== 'POST') {
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+  if (!normalizeTruthyHeader(env.UPTIMER_PUBLIC_MONITOR_UPDATE_FRAGMENT_WRITES ?? null)) {
+    return buildNotFoundJsonResponse(request.headers.get('Origin'));
+  }
+  if (!hasValidInternalAuth(request, env)) {
+    return new Response('Forbidden', { status: 403 });
+  }
+  if (isRequestBodyTooLarge(request)) {
+    return new Response('Payload Too Large', { status: 413 });
+  }
+
+  const body = await request.json().catch(() => null);
+  const parsed = internalRuntimeUpdateFragmentsWriteBodySchema.safeParse(body);
+  if (!parsed.success) {
+    return new Response('Bad Request', { status: 400 });
+  }
+  const updates = parseMonitorRuntimeUpdates(parsed.data.runtime_updates);
+  if (!updates) {
+    return new Response('Bad Request', { status: 400 });
+  }
+
+  const [{ buildMonitorRuntimeUpdateFragmentWrites }, { writePublicSnapshotFragments }] =
+    await Promise.all([
+      import('./snapshots/public-monitor-fragments'),
+      import('./snapshots/public-fragments'),
+    ]);
+  const now = Math.floor(Date.now() / 1000);
+  const fragmentWrites = buildMonitorRuntimeUpdateFragmentWrites(updates, now);
+  if (fragmentWrites.length > 0) {
+    await writePublicSnapshotFragments(env.DB, fragmentWrites);
+  }
+
+  return buildInternalJsonResponse(
+    {
+      ok: true,
+      written: fragmentWrites.length > 0,
+      update_count: updates.length,
+      write_count: fragmentWrites.length,
+    },
+    true,
+  );
+}
+
 async function handleInternalRuntimeFragmentsRefresh(
   request: Request,
   env: Env,
@@ -1024,6 +1080,9 @@ export default {
     }
     if (url.pathname === '/api/v1/internal/refresh/runtime-fragments') {
       return handleInternalRuntimeFragmentsRefresh(request, env);
+    }
+    if (url.pathname === '/api/v1/internal/write/runtime-update-fragments') {
+      return handleInternalRuntimeUpdateFragmentsWrite(request, env);
     }
     if (url.pathname === '/api/v1/internal/assemble/sharded-public-snapshot') {
       return handleInternalShardedPublicSnapshotAssemble(request, env);
