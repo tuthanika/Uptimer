@@ -17,6 +17,7 @@ import {
 } from '../schemas/public-status';
 import {
   readPublicSnapshotFragments,
+  readPublicSnapshotFragmentsPage,
   type PublicSnapshotFragmentRow,
   type PublicSnapshotFragmentWrite,
 } from './public-fragments';
@@ -242,6 +243,11 @@ export type MonitorRuntimeUpdateFragmentReadResult = {
   updates: MonitorRuntimeUpdate[];
   invalidCount: number;
   staleCount: number;
+};
+
+export type MonitorRuntimeUpdateFragmentPageReadResult = MonitorRuntimeUpdateFragmentReadResult & {
+  hasMore: boolean;
+  rowCount: number;
 };
 
 function shouldSkipRuntimeUpdateFragmentByTime(
@@ -649,4 +655,22 @@ export async function readMonitorRuntimeUpdateFragments(
 ): Promise<MonitorRuntimeUpdateFragmentReadResult> {
   const rows = await readPublicSnapshotFragments(db, MONITOR_RUNTIME_UPDATE_FRAGMENTS_KEY);
   return parseMonitorRuntimeUpdateFragmentRows(rows, opts);
+}
+
+export async function readMonitorRuntimeUpdateFragmentsPage(
+  db: D1Database,
+  opts: MonitorRuntimeUpdateFragmentReadOptions & { offset: number; limit: number },
+): Promise<MonitorRuntimeUpdateFragmentPageReadResult> {
+  const readLimit = Math.max(1, Math.floor(opts.limit)) + 1;
+  const rows = await readPublicSnapshotFragmentsPage(db, MONITOR_RUNTIME_UPDATE_FRAGMENTS_KEY, {
+    offset: Math.max(0, Math.floor(opts.offset)),
+    limit: readLimit,
+  });
+  const pageRows = rows.slice(0, Math.max(1, Math.floor(opts.limit)));
+  const parsed = parseMonitorRuntimeUpdateFragmentRows(pageRows, opts);
+  return {
+    ...parsed,
+    hasMore: rows.length > pageRows.length,
+    rowCount: pageRows.length,
+  };
 }

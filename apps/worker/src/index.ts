@@ -63,6 +63,94 @@ function wantsRuntimeUpdateFragmentsOnly(request: Request): boolean {
   return normalizeTruthyHeader(request.headers.get('X-Uptimer-Runtime-Fragments-Only'));
 }
 
+function shouldLogInternalCheckBatchDiagnostics(env: Env): boolean {
+  return normalizeTruthyHeader(env.UPTIMER_INTERNAL_CHECK_BATCH_DIAGNOSTICS ?? null);
+}
+
+type InternalCheckBatchDiagnosticTimings = Record<string, number>;
+
+async function timeInternalCheckBatchDiagnostic<T>(
+  enabled: boolean,
+  timings: InternalCheckBatchDiagnosticTimings,
+  label: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (!enabled) {
+    return await fn();
+  }
+  const startedAt = performance.now();
+  try {
+    return await fn();
+  } finally {
+    timings[label] = performance.now() - startedAt;
+  }
+}
+
+function timeInternalCheckBatchDiagnosticSync<T>(
+  enabled: boolean,
+  timings: InternalCheckBatchDiagnosticTimings,
+  label: string,
+  fn: () => T,
+): T {
+  if (!enabled) {
+    return fn();
+  }
+  const startedAt = performance.now();
+  try {
+    return fn();
+  } finally {
+    timings[label] = performance.now() - startedAt;
+  }
+}
+
+function formatDiagnosticMs(value: number | undefined): string {
+  return (value ?? 0).toFixed(2);
+}
+
+function logInternalCheckBatchDiagnostics(opts: {
+  enabled: boolean;
+  timings: InternalCheckBatchDiagnosticTimings;
+  startedAt: number;
+  idCount: number;
+  runtimeFragmentsOnly: boolean;
+  fragmentWriteCount: number;
+  runtimeUpdateCount: number;
+  processedCount: number;
+  rejectedCount: number;
+  attemptTotal: number;
+  httpCount: number;
+  tcpCount: number;
+  checksDurMs: number;
+  persistDurMs: number;
+}): void {
+  if (!opts.enabled) return;
+  console.log(
+    [
+      'internal_check_batch',
+      `ids=${opts.idCount}`,
+      `runtime_fragments_only=${opts.runtimeFragmentsOnly ? 1 : 0}`,
+      `fragment_writes=${opts.fragmentWriteCount}`,
+      `runtime_updates=${opts.runtimeUpdateCount}`,
+      `processed=${opts.processedCount}`,
+      `rejected=${opts.rejectedCount}`,
+      `attempts=${opts.attemptTotal}`,
+      `http=${opts.httpCount}`,
+      `tcp=${opts.tcpCount}`,
+      `checks_ms=${opts.checksDurMs.toFixed(2)}`,
+      `persist_ms=${opts.persistDurMs.toFixed(2)}`,
+      `parse_ms=${formatDiagnosticMs(opts.timings.parse)}`,
+      `import_ms=${formatDiagnosticMs(opts.timings.imports)}`,
+      `notify_ms=${formatDiagnosticMs(opts.timings.notify)}`,
+      `run_ms=${formatDiagnosticMs(opts.timings.run)}`,
+      `fragment_import_ms=${formatDiagnosticMs(opts.timings.fragmentImports)}`,
+      `fragment_build_ms=${formatDiagnosticMs(opts.timings.fragmentBuild)}`,
+      `fragment_write_ms=${formatDiagnosticMs(opts.timings.fragmentWrite)}`,
+      `stringify_ms=${formatDiagnosticMs(opts.timings.stringify)}`,
+      `total_ms=${(performance.now() - opts.startedAt).toFixed(2)}`,
+    ].join(' '),
+  );
+}
+
 function buildInternalRefreshResponse(ok: boolean, refreshed: boolean): Response {
   return new Response(JSON.stringify({ ok, refreshed }), {
     status: ok ? 200 : 500,
@@ -116,6 +204,7 @@ const internalShardedPublicSnapshotBodySchema = z.object({
   kind: z.enum(['homepage', 'status']),
   assembly: z.enum(['validated', 'json']).optional().default('validated'),
   measure_body_bytes: z.boolean().optional().default(false),
+  publish: z.boolean().optional().default(false),
 });
 
 const internalShardedPublicSnapshotSeedBodySchema = z.object({
@@ -126,7 +215,11 @@ const internalShardedPublicSnapshotSeedBodySchema = z.object({
 });
 
 const internalShardedPublicSnapshotContinuationBodySchema = z.discriminatedUnion('step', [
-  z.object({ step: z.literal('runtime') }),
+  z.object({
+    step: z.literal('runtime'),
+    update_offset: z.number().int().min(0).optional(),
+    update_limit: z.number().int().min(1).max(10).optional(),
+  }),
   z.object({
     step: z.literal('seed'),
     kind: z.enum(['homepage', 'status']),
@@ -408,11 +501,16 @@ async function handleInternalShardedPublicSnapshotAssemble(
   const { assembleShardedPublicSnapshot } = await import(
     './internal/sharded-public-snapshot-core'
   );
+  const canPublish =
+    parsed.data.publish &&
+    normalizeTruthyHeader(env.UPTIMER_PUBLIC_SHARDED_SNAPSHOT_PUBLISH ?? null);
   const result = await assembleShardedPublicSnapshot({
     env,
     kind: parsed.data.kind,
     mode: parsed.data.assembly,
     measureBodyBytes: parsed.data.measure_body_bytes,
+    publish: canPublish,
+    now: Math.floor(Date.now() / 1000),
   });
   return buildInternalJsonResponse(
     {
@@ -425,7 +523,15 @@ async function handleInternalShardedPublicSnapshotAssemble(
       stale_count: result.staleCount,
       ...(result.generatedAt !== undefined ? { generated_at: result.generatedAt } : {}),
       ...(result.bodyBytes !== undefined ? { body_bytes: result.bodyBytes } : {}),
+      ...(result.published !== undefined ? { published: result.published } : {}),
+      ...(result.artifactPublished !== undefined
+        ? { artifact_published: result.artifactPublished }
+        : {}),
+      ...(result.writeCount !== undefined ? { write_count: result.writeCount } : {}),
       ...(result.skip ? { skip: result.skip } : {}),
+      ...(result.error ? { error: true } : {}),
+      ...(result.errorName ? { error_name: result.errorName } : {}),
+      ...(result.errorMessage ? { error_message: result.errorMessage } : {}),
     },
     result.ok,
   );
@@ -520,7 +626,15 @@ async function handleInternalShardedPublicSnapshotContinuation(
     ctx,
     now: Math.floor(Date.now() / 1000),
     step: parsed.data.step === 'runtime'
-      ? { step: 'runtime' }
+      ? {
+          step: 'runtime',
+          ...(parsed.data.update_offset !== undefined
+            ? { updateOffset: parsed.data.update_offset }
+            : {}),
+          ...(parsed.data.update_limit !== undefined
+            ? { updateLimit: parsed.data.update_limit }
+            : {}),
+        }
       : parsed.data.step === 'assemble'
         ? { step: 'assemble', kind: parsed.data.kind }
         : {
@@ -531,19 +645,24 @@ async function handleInternalShardedPublicSnapshotContinuation(
             monitorLimit: parsed.data.monitor_limit,
           },
   });
-  const nextStep = result.nextStep
-    ? result.nextStep.step === 'runtime'
-      ? { step: 'runtime' }
-      : result.nextStep.step === 'assemble'
-        ? { step: 'assemble', kind: result.nextStep.kind }
+  const toResponseStep = (step: NonNullable<typeof result.nextStep>) =>
+    step.step === 'runtime'
+      ? {
+          step: 'runtime',
+          ...(step.updateOffset !== undefined ? { update_offset: step.updateOffset } : {}),
+          ...(step.updateLimit !== undefined ? { update_limit: step.updateLimit } : {}),
+        }
+      : step.step === 'assemble'
+        ? { step: 'assemble', kind: step.kind }
         : {
             step: 'seed',
-            kind: result.nextStep.kind,
-            part: result.nextStep.part,
-            monitor_offset: result.nextStep.monitorOffset ?? 0,
-            monitor_limit: result.nextStep.monitorLimit ?? 5,
-          }
-    : undefined;
+            kind: step.kind,
+            part: step.part,
+            monitor_offset: step.monitorOffset ?? 0,
+            monitor_limit: step.monitorLimit ?? 5,
+          };
+  const nextStep = result.nextStep ? toResponseStep(result.nextStep) : undefined;
+  const nextSteps = result.nextSteps?.map(toResponseStep);
   return buildInternalJsonResponse(
     {
       ok: result.ok,
@@ -552,6 +671,10 @@ async function handleInternalShardedPublicSnapshotContinuation(
       ...(result.refreshed !== undefined ? { refreshed: result.refreshed } : {}),
       ...(result.seeded !== undefined ? { seeded: result.seeded } : {}),
       ...(result.assembled !== undefined ? { assembled: result.assembled } : {}),
+      ...(result.published !== undefined ? { published: result.published } : {}),
+      ...(result.artifactPublished !== undefined
+        ? { artifact_published: result.artifactPublished }
+        : {}),
       ...(result.kind ? { kind: result.kind } : {}),
       ...(result.part ? { part: result.part } : {}),
       ...(result.monitorCount !== undefined ? { monitor_count: result.monitorCount } : {}),
@@ -560,8 +683,20 @@ async function handleInternalShardedPublicSnapshotContinuation(
       ...(result.writeCount !== undefined ? { write_count: result.writeCount } : {}),
       ...(result.invalidCount !== undefined ? { invalid_count: result.invalidCount } : {}),
       ...(result.staleCount !== undefined ? { stale_count: result.staleCount } : {}),
+      ...(result.updateOffset !== undefined ? { update_offset: result.updateOffset } : {}),
+      ...(result.updateLimit !== undefined ? { update_limit: result.updateLimit } : {}),
+      ...(result.rowCount !== undefined ? { row_count: result.rowCount } : {}),
+      ...(result.hasMore !== undefined ? { has_more: result.hasMore } : {}),
       ...(result.skipped ? { skipped: result.skipped } : {}),
+      ...(result.error ? { error: true } : {}),
+      ...(result.errorName ? { error_name: result.errorName } : {}),
+      ...(result.errorMessage ? { error_message: result.errorMessage } : {}),
+      ...(result.diagnosticStep ? { diagnostic_step: result.diagnosticStep } : {}),
+      ...(result.operationMs !== undefined ? { operation_ms: result.operationMs } : {}),
+      ...(result.queueMs !== undefined ? { queue_ms: result.queueMs } : {}),
+      ...(result.totalMs !== undefined ? { total_ms: result.totalMs } : {}),
       ...(nextStep ? { next_step: nextStep } : {}),
+      ...(nextSteps && nextSteps.length > 0 ? { next_steps: nextSteps } : {}),
     },
     result.ok,
   );
@@ -610,6 +745,9 @@ async function handleInternalScheduledCheckBatch(
   ctx: ExecutionContext,
 ): Promise<Response> {
   const maxPastCheckedAtSkewSeconds = 5 * 60;
+  const diagnosticsEnabled = shouldLogInternalCheckBatchDiagnostics(env);
+  const diagnosticsStartedAt = diagnosticsEnabled ? performance.now() : 0;
+  const diagnosticsTimings: InternalCheckBatchDiagnosticTimings = {};
   if (!isInternalServiceRequest(request)) {
     return buildNotFoundJsonResponse(request.headers.get('Origin'));
   }
@@ -636,9 +774,18 @@ async function handleInternalScheduledCheckBatch(
   }
   trace?.setLabel('route', 'internal/scheduled-check-batch');
 
-  const rawBody = trace
-    ? await trace.timeAsync('check_batch_parse_body', async () => await request.json().catch(() => null))
-    : await request.json().catch(() => null);
+  const rawBody = await timeInternalCheckBatchDiagnostic(
+    diagnosticsEnabled,
+    diagnosticsTimings,
+    'parse',
+    async () =>
+      trace
+        ? await trace.timeAsync(
+            'check_batch_parse_body',
+            async () => await request.json().catch(() => null),
+          )
+        : await request.json().catch(() => null),
+  );
   const parsedBody = parseInternalScheduledCheckBatchBody(rawBody);
   if (!parsedBody) {
     return new Response('Forbidden', { status: 403 });
@@ -658,31 +805,43 @@ async function handleInternalScheduledCheckBatch(
 
   const ids = [...new Set(parsedBody.ids)];
   const suppressedMonitorIds = new Set(parsedBody.suppressed_monitor_ids ?? []);
-  const [{ runExclusivePersistedMonitorBatch }, notificationsModule] = await (trace
-    ? trace.timeAsync(
-        'check_batch_import_modules',
-        async () =>
-          await Promise.all([
+  const [{ runExclusivePersistedMonitorBatch }, notificationsModule] = await timeInternalCheckBatchDiagnostic(
+    diagnosticsEnabled,
+    diagnosticsTimings,
+    'imports',
+    async () =>
+      await (trace
+        ? trace.timeAsync(
+            'check_batch_import_modules',
+            async () =>
+              await Promise.all([
+                import('./scheduler/scheduled'),
+                parsedBody.allow_notifications === true
+                  ? import('./scheduler/notifications')
+                  : Promise.resolve(null),
+              ]),
+          )
+        : Promise.all([
             import('./scheduler/scheduled'),
             parsedBody.allow_notifications === true
               ? import('./scheduler/notifications')
               : Promise.resolve(null),
-          ]),
-      )
-    : Promise.all([
-        import('./scheduler/scheduled'),
-        parsedBody.allow_notifications === true
-          ? import('./scheduler/notifications')
-          : Promise.resolve(null),
-      ]));
+          ])),
+  );
 
   const notify = notificationsModule
-    ? trace
-      ? await trace.timeAsync(
-          'check_batch_notify_context',
-          async () => await notificationsModule.createNotifyContext(env, ctx),
-        )
-      : await notificationsModule.createNotifyContext(env, ctx)
+    ? await timeInternalCheckBatchDiagnostic(
+        diagnosticsEnabled,
+        diagnosticsTimings,
+        'notify',
+        async () =>
+          trace
+            ? await trace.timeAsync(
+                'check_batch_notify_context',
+                async () => await notificationsModule.createNotifyContext(env, ctx),
+              )
+            : await notificationsModule.createNotifyContext(env, ctx),
+      )
     : null;
   let result;
   try {
@@ -705,7 +864,12 @@ async function handleInternalScheduledCheckBatch(
           : {}),
         ...(trace ? { trace } : {}),
       });
-    result = trace ? await trace.timeAsync('check_batch_run', runBatch) : await runBatch();
+    result = await timeInternalCheckBatchDiagnostic(
+      diagnosticsEnabled,
+      diagnosticsTimings,
+      'run',
+      async () => (trace ? await trace.timeAsync('check_batch_run', runBatch) : await runBatch()),
+    );
   } catch (err) {
     if (err instanceof LeaseLostError) {
       console.warn(err.message);
@@ -732,12 +896,26 @@ async function handleInternalScheduledCheckBatch(
   );
   const runtimeFragmentsOnly =
     monitorUpdateFragmentWritesEnabled && wantsRuntimeUpdateFragmentsOnly(request);
+  let fragmentWriteCount = 0;
   if (monitorUpdateFragmentWritesEnabled) {
-    const { buildMonitorRuntimeUpdateFragmentWrites } = await import(
-      './snapshots/public-monitor-fragments'
+    const [{ buildMonitorRuntimeUpdateFragmentWrites }, { writePublicSnapshotFragments }] =
+      await timeInternalCheckBatchDiagnostic(
+        diagnosticsEnabled,
+        diagnosticsTimings,
+        'fragmentImports',
+        async () =>
+          await Promise.all([
+            import('./snapshots/public-monitor-fragments'),
+            import('./snapshots/public-fragments'),
+          ]),
+      );
+    const fragmentWrites = timeInternalCheckBatchDiagnosticSync(
+      diagnosticsEnabled,
+      diagnosticsTimings,
+      'fragmentBuild',
+      () => buildMonitorRuntimeUpdateFragmentWrites(result.runtimeUpdates, now),
     );
-    const { writePublicSnapshotFragments } = await import('./snapshots/public-fragments');
-    const fragmentWrites = buildMonitorRuntimeUpdateFragmentWrites(result.runtimeUpdates, now);
+    fragmentWriteCount = fragmentWrites.length;
     if (trace?.enabled) {
       trace.setLabel('monitor_update_fragment_write_count', fragmentWrites.length);
       trace.setLabel('runtime_updates_fragmented', runtimeFragmentsOnly ? 1 : 0);
@@ -748,7 +926,12 @@ async function handleInternalScheduledCheckBatch(
           console.warn('internal scheduled check batch: monitor update fragment write failed', err);
         });
       if (runtimeFragmentsOnly) {
-        await writeFragments();
+        await timeInternalCheckBatchDiagnostic(
+          diagnosticsEnabled,
+          diagnosticsTimings,
+          'fragmentWrite',
+          writeFragments,
+        );
       } else {
         ctx.waitUntil(writeFragments());
       }
@@ -773,9 +956,31 @@ async function handleInternalScheduledCheckBatch(
     checks_duration_ms: result.checksDurMs,
     persist_duration_ms: result.persistDurMs,
   };
-  const bodyText = trace
-    ? trace.time('check_batch_stringify_response', () => JSON.stringify(responsePayload))
-    : JSON.stringify(responsePayload);
+  const bodyText = timeInternalCheckBatchDiagnosticSync(
+    diagnosticsEnabled,
+    diagnosticsTimings,
+    'stringify',
+    () =>
+      trace
+        ? trace.time('check_batch_stringify_response', () => JSON.stringify(responsePayload))
+        : JSON.stringify(responsePayload),
+  );
+  logInternalCheckBatchDiagnostics({
+    enabled: diagnosticsEnabled,
+    timings: diagnosticsTimings,
+    startedAt: diagnosticsStartedAt,
+    idCount: ids.length,
+    runtimeFragmentsOnly,
+    fragmentWriteCount,
+    runtimeUpdateCount: result.runtimeUpdates.length,
+    processedCount: result.stats.processedCount,
+    rejectedCount: result.stats.rejectedCount,
+    attemptTotal: result.stats.attemptTotal,
+    httpCount: result.stats.httpCount,
+    tcpCount: result.stats.tcpCount,
+    checksDurMs: result.checksDurMs,
+    persistDurMs: result.persistDurMs,
+  });
   return finalizeInternalCheckBatchResponse(new Response(
     bodyText,
     {

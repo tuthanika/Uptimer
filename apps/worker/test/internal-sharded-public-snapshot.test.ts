@@ -132,7 +132,7 @@ function homepagePayload() {
   };
 }
 
-function createFragmentEnv(): Env {
+function createFragmentEnv(extraHandlers: Parameters<typeof createFakeD1Database>[0] = []): Env {
   const statusEnvelope = buildStatusEnvelopeFragmentWrite(statusPayload(), 1_700_000_005);
   const statusMonitors = buildStatusMonitorFragmentWrites(statusPayload(), 1_700_000_005);
   const homepageEnvelope = buildHomepageEnvelopeFragmentWrite(homepagePayload(), 1_700_000_005);
@@ -157,6 +157,7 @@ function createFragmentEnv(): Env {
           }
         },
       },
+      ...extraHandlers,
     ]),
     ADMIN_TOKEN: 'test-admin-token',
     UPTIMER_PUBLIC_SHARDED_ASSEMBLER: '1',
@@ -241,6 +242,132 @@ describe('internal sharded public snapshot assembler route', () => {
     });
   });
 
+  it('reports internal assembly errors with bounded diagnostics', async () => {
+    const env = {
+      DB: createFakeD1Database([
+        {
+          match: 'from public_snapshot_fragments',
+          all: () => {
+            throw new Error('fragment read failed');
+          },
+        },
+      ]),
+      ADMIN_TOKEN: 'test-admin-token',
+      UPTIMER_PUBLIC_SHARDED_ASSEMBLER: '1',
+    } as unknown as Env;
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/assemble/sharded-public-snapshot', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({ kind: 'status', assembly: 'json' }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(500);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: false,
+      assembled: false,
+      kind: 'status',
+      assembly: 'json',
+      error: true,
+      error_name: 'Error',
+      error_message: 'fragment read failed',
+    });
+  });
+
+  it('publishes raw assembled JSON to the static snapshot row when explicitly requested and enabled', async () => {
+    const writes: unknown[][] = [];
+    const env = {
+      ...createFragmentEnv([
+        {
+          match: 'insert into public_snapshots',
+          run: (args) => {
+            writes.push(args);
+            return { meta: { changes: 1 } };
+          },
+        },
+      ]),
+      UPTIMER_PUBLIC_SHARDED_SNAPSHOT_PUBLISH: '1',
+    } as unknown as Env;
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/assemble/sharded-public-snapshot', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({ kind: 'status', assembly: 'json', publish: true }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      assembled: true,
+      kind: 'status',
+      assembly: 'json',
+      published: true,
+      write_count: 1,
+    });
+    expect(writes).toHaveLength(1);
+    expect(writes[0]![0]).toBe('status');
+    expect(writes[0]![1]).toBe(1_700_000_000);
+    expect(typeof writes[0]![2]).toBe('string');
+  });
+
+  it('publishes the homepage artifact row with preload HTML when publishing homepage JSON', async () => {
+    const writes: unknown[][] = [];
+    const env = {
+      ...createFragmentEnv([
+        {
+          match: 'insert into public_snapshots',
+          run: (args) => {
+            writes.push(args);
+            return { meta: { changes: 1 } };
+          },
+        },
+      ]),
+      UPTIMER_PUBLIC_SHARDED_SNAPSHOT_PUBLISH: '1',
+    } as unknown as Env;
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/assemble/sharded-public-snapshot', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({ kind: 'homepage', assembly: 'json', publish: true }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      assembled: true,
+      kind: 'homepage',
+      assembly: 'json',
+      published: true,
+      artifact_published: true,
+      write_count: 2,
+    });
+    expect(writes.map((args) => args[0])).toEqual(['homepage', 'homepage:artifact']);
+    const artifact = JSON.parse(writes[1]![2] as string) as { preload_html?: string; snapshot?: unknown };
+    expect(artifact.preload_html).toContain('uptimer-preload');
+    expect(artifact.snapshot).toMatchObject({ generated_at: 1_700_000_000 });
+  });
+
   it('assembles fragment JSON without parsing every monitor when requested', async () => {
     const res = await worker.fetch(
       new Request('http://internal/api/v1/internal/assemble/sharded-public-snapshot', {
@@ -291,6 +418,184 @@ describe('internal sharded public snapshot continuation route', () => {
     );
 
     expect(res.status).toBe(404);
+  });
+
+  it('runs the runtime step and queues homepage/status branches in parallel', async () => {
+    const selfRequests: Request[] = [];
+    const env = {
+      DB: createFakeD1Database([
+        {
+          match: 'from public_snapshot_fragments',
+          all: () => [],
+        },
+      ]),
+      ADMIN_TOKEN: 'test-admin-token',
+      UPTIMER_SCHEDULED_SHARDED_CONTINUATION: '1',
+      UPTIMER_SCHEDULED_RUNTIME_FRAGMENT_REFRESH: '1',
+      UPTIMER_SHARDED_FRAGMENT_SEED_BATCH_SIZE: '2',
+      SELF: {
+        fetch: vi.fn(async (request: Request) => {
+          selfRequests.push(request);
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }),
+      },
+    } as unknown as Env;
+    const waitUntil = vi.fn();
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/continue/sharded-public-snapshot', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({ step: 'runtime' }),
+      }),
+      env,
+      { waitUntil } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      step: 'runtime',
+      refreshed: false,
+      continued: true,
+      next_steps: [
+        { step: 'seed', kind: 'homepage', part: 'envelope', monitor_offset: 0, monitor_limit: 2 },
+        { step: 'seed', kind: 'status', part: 'envelope', monitor_offset: 0, monitor_limit: 2 },
+      ],
+    });
+    expect(waitUntil).toHaveBeenCalledTimes(2);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+    await expect(Promise.all(selfRequests.map((request) => request.json()))).resolves.toEqual([
+      { step: 'seed', kind: 'homepage', part: 'envelope', monitor_offset: 0, monitor_limit: 2 },
+      { step: 'seed', kind: 'status', part: 'envelope', monitor_offset: 0, monitor_limit: 2 },
+    ]);
+  });
+
+  it('runs one paged runtime update step before queuing the next runtime page', async () => {
+    const selfRequests: Request[] = [];
+    const env = {
+      DB: createFakeD1Database([
+        {
+          match: 'from public_snapshot_fragments',
+          all: (args) => {
+            expect(args).toEqual(['monitor-runtime:updates', 2, 0]);
+            return [
+              {
+                fragment_key: 'monitor:1',
+                generated_at: 1,
+                body_json: '[1,60,1,1,"up","up",21]',
+                updated_at: 1,
+              },
+              {
+                fragment_key: 'monitor:2',
+                generated_at: 1,
+                body_json: '[2,60,1,1,"up","up",22]',
+                updated_at: 1,
+              },
+            ];
+          },
+        },
+      ]),
+      ADMIN_TOKEN: 'test-admin-token',
+      UPTIMER_SCHEDULED_SHARDED_CONTINUATION: '1',
+      UPTIMER_SCHEDULED_RUNTIME_FRAGMENT_REFRESH: '1',
+      UPTIMER_SHARDED_RUNTIME_UPDATE_BATCH_SIZE: '1',
+      SELF: {
+        fetch: vi.fn(async (request: Request) => {
+          selfRequests.push(request);
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        }),
+      },
+    } as unknown as Env;
+    const waitUntil = vi.fn();
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/continue/sharded-public-snapshot', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({ step: 'runtime' }),
+      }),
+      env,
+      { waitUntil } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toMatchObject({
+      ok: true,
+      step: 'runtime',
+      refreshed: false,
+      continued: true,
+      monitor_count: 0,
+      update_offset: 0,
+      update_limit: 1,
+      row_count: 1,
+      has_more: true,
+      skipped: 'no_updates',
+      next_steps: [{ step: 'runtime', update_offset: 1, update_limit: 1 }],
+    });
+    expect(waitUntil).toHaveBeenCalledTimes(1);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+    await expect(selfRequests[0]!.json()).resolves.toEqual({
+      step: 'runtime',
+      update_offset: 1,
+      update_limit: 1,
+    });
+  });
+
+  it('emits bounded continuation diagnostics when explicitly enabled', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const env = {
+      DB: createFakeD1Database([
+        {
+          match: 'from public_snapshot_fragments',
+          all: () => [],
+        },
+      ]),
+      ADMIN_TOKEN: 'test-admin-token',
+      UPTIMER_SCHEDULED_SHARDED_CONTINUATION: '1',
+      UPTIMER_SCHEDULED_RUNTIME_FRAGMENT_REFRESH: '1',
+      UPTIMER_SHARDED_CONTINUATION_DIAGNOSTICS: '1',
+    } as unknown as Env;
+
+    try {
+      const res = await worker.fetch(
+        new Request('http://internal/api/v1/internal/continue/sharded-public-snapshot', {
+          method: 'POST',
+          headers: {
+            Authorization: 'Bearer test-admin-token',
+            'Content-Type': 'application/json; charset=utf-8',
+          },
+          body: JSON.stringify({ step: 'runtime' }),
+        }),
+        env,
+        { waitUntil: vi.fn() } as unknown as ExecutionContext,
+      );
+
+      expect(res.status).toBe(200);
+      await expect(res.json()).resolves.toMatchObject({
+        ok: true,
+        step: 'runtime',
+        refreshed: false,
+        continued: false,
+        diagnostic_step: 'runtime',
+        operation_ms: expect.any(Number),
+        queue_ms: expect.any(Number),
+        total_ms: expect.any(Number),
+      });
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining('sharded_continuation_step step=runtime'),
+      );
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('skipped=no_updates'));
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   it('runs one bounded seed step and queues the next continuation', async () => {
@@ -366,7 +671,7 @@ describe('internal sharded public snapshot continuation route', () => {
       monitor_limit: 1,
       write_count: 1,
       continued: true,
-      next_step: { step: 'assemble', kind: 'homepage' },
+      next_step: { step: 'assemble', kind: 'status' },
     });
     expect(writes).toHaveLength(1);
     expect(waitUntil).toHaveBeenCalledTimes(1);
@@ -378,7 +683,7 @@ describe('internal sharded public snapshot continuation route', () => {
     );
     await expect(selfRequests[0]!.json()).resolves.toEqual({
       step: 'assemble',
-      kind: 'homepage',
+      kind: 'status',
     });
   });
 });

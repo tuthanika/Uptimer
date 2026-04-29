@@ -1,5 +1,8 @@
 import type { Env } from '../env';
-import { refreshMonitorRuntimeSnapshotFromUpdateFragments } from './runtime-fragments-refresh-core';
+import {
+  refreshMonitorRuntimeSnapshotFromUpdateFragments,
+  refreshMonitorRuntimeSnapshotFromUpdateFragmentsPage,
+} from './runtime-fragments-refresh-core';
 import {
   assembleShardedPublicSnapshot,
   seedShardedPublicSnapshotFragments,
@@ -9,7 +12,7 @@ import {
 } from './sharded-public-snapshot-core';
 
 export type ShardedPublicSnapshotContinuationStep =
-  | { step: 'runtime' }
+  | { step: 'runtime'; updateOffset?: number; updateLimit?: number }
   | {
       step: 'seed';
       kind: ShardedPublicSnapshotKind;
@@ -24,9 +27,12 @@ export type ShardedPublicSnapshotContinuationResult = {
   step: ShardedPublicSnapshotContinuationStep['step'];
   continued: boolean;
   nextStep?: ShardedPublicSnapshotContinuationStep;
+  nextSteps?: ShardedPublicSnapshotContinuationStep[];
   refreshed?: boolean;
   seeded?: boolean;
   assembled?: boolean;
+  published?: boolean;
+  artifactPublished?: boolean;
   kind?: ShardedPublicSnapshotKind;
   part?: Exclude<ShardedPublicSnapshotSeedPart, 'all'>;
   monitorCount?: number;
@@ -35,8 +41,18 @@ export type ShardedPublicSnapshotContinuationResult = {
   writeCount?: number;
   invalidCount?: number;
   staleCount?: number;
+  updateOffset?: number;
+  updateLimit?: number;
+  rowCount?: number;
+  hasMore?: boolean;
   skipped?: string;
   error?: boolean;
+  errorName?: string;
+  errorMessage?: string;
+  diagnosticStep?: string;
+  operationMs?: number;
+  queueMs?: number;
+  totalMs?: number;
 };
 
 const CONTINUATION_PATH = '/api/v1/internal/continue/sharded-public-snapshot';
@@ -52,6 +68,13 @@ function readBoundedMonitorLimit(env: Env, requested?: number): number {
   const raw = requested ?? (env as unknown as Record<string, unknown>).UPTIMER_SHARDED_FRAGMENT_SEED_BATCH_SIZE;
   const parsed = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number.parseInt(raw, 10) : NaN;
   if (!Number.isFinite(parsed)) return DEFAULT_MONITOR_LIMIT;
+  return Math.max(1, Math.min(10, Math.floor(parsed)));
+}
+
+function readOptionalBoundedRuntimeUpdateLimit(env: Env, requested?: number): number | null {
+  const raw = requested ?? (env as unknown as Record<string, unknown>).UPTIMER_SHARDED_RUNTIME_UPDATE_BATCH_SIZE;
+  const parsed = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number.parseInt(raw, 10) : NaN;
+  if (!Number.isFinite(parsed)) return null;
   return Math.max(1, Math.min(10, Math.floor(parsed)));
 }
 
@@ -80,6 +103,64 @@ function canAssembleShardedSnapshots(env: Env): boolean {
   );
 }
 
+function shouldPublishShardedSnapshots(env: Env): boolean {
+  const raw = env as unknown as Record<string, unknown>;
+  return (
+    isTruthyEnvFlag(raw.UPTIMER_PUBLIC_SHARDED_SNAPSHOT_PUBLISH) &&
+    isTruthyEnvFlag(raw.UPTIMER_SCHEDULED_SHARDED_PUBLISH)
+  );
+}
+
+function shouldLogDiagnostics(env: Env): boolean {
+  return isTruthyEnvFlag((env as unknown as Record<string, unknown>).UPTIMER_SHARDED_CONTINUATION_DIAGNOSTICS);
+}
+
+function diagnosticStepName(step: ShardedPublicSnapshotContinuationStep): string {
+  if (step.step === 'runtime') {
+    return step.updateLimit !== undefined ? `runtime:${step.updateOffset ?? 0}` : 'runtime';
+  }
+  if (step.step === 'assemble') return `assemble:${step.kind}`;
+  return `seed:${step.kind}:${step.part}:${step.monitorOffset ?? 0}`;
+}
+
+function logContinuationDiagnostics(
+  env: Env,
+  result: ShardedPublicSnapshotContinuationResult,
+): void {
+  if (!shouldLogDiagnostics(env)) return;
+  const fields = [
+    'sharded_continuation_step',
+    `step=${result.diagnosticStep ?? result.step}`,
+    result.kind ? `kind=${result.kind}` : null,
+    result.part ? `part=${result.part}` : null,
+    result.monitorOffset !== undefined ? `offset=${result.monitorOffset}` : null,
+    result.monitorLimit !== undefined ? `limit=${result.monitorLimit}` : null,
+    `ok=${result.ok ? 1 : 0}`,
+    `continued=${result.continued ? 1 : 0}`,
+    result.refreshed !== undefined ? `refreshed=${result.refreshed ? 1 : 0}` : null,
+    result.seeded !== undefined ? `seeded=${result.seeded ? 1 : 0}` : null,
+    result.assembled !== undefined ? `assembled=${result.assembled ? 1 : 0}` : null,
+    result.published !== undefined ? `published=${result.published ? 1 : 0}` : null,
+    result.artifactPublished !== undefined
+      ? `artifact_published=${result.artifactPublished ? 1 : 0}`
+      : null,
+    result.monitorCount !== undefined ? `monitors=${result.monitorCount}` : null,
+    result.writeCount !== undefined ? `writes=${result.writeCount}` : null,
+    result.updateOffset !== undefined ? `update_offset=${result.updateOffset}` : null,
+    result.updateLimit !== undefined ? `update_limit=${result.updateLimit}` : null,
+    result.rowCount !== undefined ? `rows=${result.rowCount}` : null,
+    result.hasMore !== undefined ? `has_more=${result.hasMore ? 1 : 0}` : null,
+    result.invalidCount !== undefined ? `invalid=${result.invalidCount}` : null,
+    result.staleCount !== undefined ? `stale=${result.staleCount}` : null,
+    result.skipped ? `skipped=${result.skipped}` : null,
+    result.error ? 'error=1' : null,
+    result.operationMs !== undefined ? `operation_ms=${result.operationMs}` : null,
+    result.queueMs !== undefined ? `queue_ms=${result.queueMs}` : null,
+    result.totalMs !== undefined ? `total_ms=${result.totalMs}` : null,
+  ].filter((field): field is string => Boolean(field));
+  console.log(fields.join(' '));
+}
+
 function nextSeedStep(opts: {
   kind: ShardedPublicSnapshotKind;
   part: Exclude<ShardedPublicSnapshotSeedPart, 'all'>;
@@ -96,9 +177,7 @@ function nextSeedStep(opts: {
           monitorOffset: 0,
           monitorLimit: opts.monitorLimit,
         }
-      : opts.kind === 'homepage'
-        ? { step: 'seed', kind: 'status', part: 'envelope', monitorOffset: 0, monitorLimit: opts.monitorLimit }
-        : { step: 'assemble', kind: 'homepage' };
+      : { step: 'assemble', kind: opts.kind };
   }
 
   const nextOffset = opts.monitorOffset + opts.monitorLimit;
@@ -112,13 +191,26 @@ function nextSeedStep(opts: {
     };
   }
 
-  return opts.kind === 'homepage'
-    ? { step: 'seed', kind: 'status', part: 'envelope', monitorOffset: 0, monitorLimit: opts.monitorLimit }
-    : { step: 'assemble', kind: 'homepage' };
+  return { step: 'assemble', kind: opts.kind };
 }
 
-function nextAssembleStep(kind: ShardedPublicSnapshotKind): ShardedPublicSnapshotContinuationStep | null {
-  return kind === 'homepage' ? { step: 'assemble', kind: 'status' } : null;
+function firstSeedSteps(monitorLimit: number): ShardedPublicSnapshotContinuationStep[] {
+  return [
+    {
+      step: 'seed',
+      kind: 'homepage',
+      part: 'envelope',
+      monitorOffset: 0,
+      monitorLimit,
+    },
+    {
+      step: 'seed',
+      kind: 'status',
+      part: 'envelope',
+      monitorOffset: 0,
+      monitorLimit,
+    },
+  ];
 }
 
 function toWireStep(step: ShardedPublicSnapshotContinuationStep): Record<string, unknown> {
@@ -134,7 +226,11 @@ function toWireStep(step: ShardedPublicSnapshotContinuationStep): Record<string,
   if (step.step === 'assemble') {
     return { step: step.step, kind: step.kind };
   }
-  return { step: step.step };
+  return {
+    step: step.step,
+    ...(step.updateOffset !== undefined ? { update_offset: step.updateOffset } : {}),
+    ...(step.updateLimit !== undefined ? { update_limit: step.updateLimit } : {}),
+  };
 }
 
 function queueContinuation(
@@ -142,34 +238,46 @@ function queueContinuation(
   ctx: ExecutionContext,
   nextStep: ShardedPublicSnapshotContinuationStep | null,
 ): boolean {
-  if (!nextStep || !env.SELF || !env.ADMIN_TOKEN) {
-    return false;
+  return queueContinuations(env, ctx, nextStep ? [nextStep] : []) > 0;
+}
+
+function queueContinuations(
+  env: Env,
+  ctx: ExecutionContext,
+  nextSteps: readonly ShardedPublicSnapshotContinuationStep[],
+): number {
+  if (nextSteps.length === 0 || !env.SELF || !env.ADMIN_TOKEN) {
+    return 0;
   }
 
-  ctx.waitUntil(
-    env.SELF.fetch(
-      new Request(`http://internal${CONTINUATION_PATH}`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${env.ADMIN_TOKEN}`,
-          'Content-Type': 'application/json; charset=utf-8',
-        },
-        body: JSON.stringify(toWireStep(nextStep)),
-      }),
-    )
-      .then(async (res) => {
-        const bodyText = await res.text().catch(() => '');
-        if (!res.ok) {
-          throw new Error(
-            `sharded public snapshot continuation failed: HTTP ${res.status} ${bodyText}`.trim(),
-          );
-        }
-      })
-      .catch((err) => {
-        console.warn('sharded public snapshot continuation dispatch failed', err);
-      }),
-  );
-  return true;
+  let queued = 0;
+  for (const nextStep of nextSteps) {
+    queued += 1;
+    ctx.waitUntil(
+      env.SELF.fetch(
+        new Request(`http://internal${CONTINUATION_PATH}`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${env.ADMIN_TOKEN}`,
+            'Content-Type': 'application/json; charset=utf-8',
+          },
+          body: JSON.stringify(toWireStep(nextStep)),
+        }),
+      )
+        .then(async (res) => {
+          const bodyText = await res.text().catch(() => '');
+          if (!res.ok) {
+            throw new Error(
+              `sharded public snapshot continuation failed: HTTP ${res.status} ${bodyText}`.trim(),
+            );
+          }
+        })
+        .catch((err) => {
+          console.warn('sharded public snapshot continuation dispatch failed', err);
+        }),
+    );
+  }
+  return queued;
 }
 
 export async function runShardedPublicSnapshotContinuation(opts: {
@@ -178,23 +286,47 @@ export async function runShardedPublicSnapshotContinuation(opts: {
   now: number;
   step: ShardedPublicSnapshotContinuationStep;
 }): Promise<ShardedPublicSnapshotContinuationResult> {
+  const diagnostics = shouldLogDiagnostics(opts.env);
+  const startedAt = diagnostics ? Date.now() : 0;
+  const diagnosticStep = diagnosticStepName(opts.step);
+
   if (opts.step.step === 'runtime') {
     if (!canRefreshRuntimeFragments(opts.env)) {
-      return { ok: true, step: 'runtime', continued: false, skipped: 'runtime_disabled' };
+      const skippedResult: ShardedPublicSnapshotContinuationResult = {
+        ok: true,
+        step: 'runtime',
+        continued: false,
+        skipped: 'runtime_disabled',
+        ...(diagnostics ? { diagnosticStep, totalMs: Date.now() - startedAt } : {}),
+      };
+      logContinuationDiagnostics(opts.env, skippedResult);
+      return skippedResult;
     }
-    const result = await refreshMonitorRuntimeSnapshotFromUpdateFragments({
-      env: opts.env,
-      now: opts.now,
-    });
-    const nextStep: ShardedPublicSnapshotContinuationStep = {
-      step: 'seed',
-      kind: 'homepage',
-      part: 'envelope',
-      monitorOffset: 0,
-      monitorLimit: readBoundedMonitorLimit(opts.env),
-    };
-    const continued = queueContinuation(opts.env, opts.ctx, nextStep);
-    return {
+    const runtimeLimit = readOptionalBoundedRuntimeUpdateLimit(opts.env, opts.step.updateLimit);
+    const updateOffset = Math.max(0, Math.floor(opts.step.updateOffset ?? 0));
+    const operationStartedAt = diagnostics ? Date.now() : 0;
+    const result = runtimeLimit
+      ? await refreshMonitorRuntimeSnapshotFromUpdateFragmentsPage({
+          env: opts.env,
+          now: opts.now,
+          offset: updateOffset,
+          limit: runtimeLimit,
+        })
+      : await refreshMonitorRuntimeSnapshotFromUpdateFragments({
+          env: opts.env,
+          now: opts.now,
+        });
+    const operationMs = diagnostics ? Date.now() - operationStartedAt : undefined;
+    const nextSteps: ShardedPublicSnapshotContinuationStep[] = !result.ok
+      ? []
+      : runtimeLimit && result.hasMore
+        ? [{ step: 'runtime', updateOffset: updateOffset + runtimeLimit, updateLimit: runtimeLimit }]
+        : firstSeedSteps(readBoundedMonitorLimit(opts.env));
+    const queueStartedAt = diagnostics ? Date.now() : 0;
+    const continuedCount = queueContinuations(opts.env, opts.ctx, nextSteps);
+    const queueMs = diagnostics ? Date.now() - queueStartedAt : undefined;
+    const continued = continuedCount > 0;
+    const continuationResult: ShardedPublicSnapshotContinuationResult = {
       ok: result.ok,
       step: 'runtime',
       refreshed: result.refreshed,
@@ -202,17 +334,48 @@ export async function runShardedPublicSnapshotContinuation(opts: {
       staleCount: result.staleCount,
       monitorCount: result.updateCount,
       continued,
-      ...(continued ? { nextStep } : {}),
+      ...(continued ? { nextSteps: nextSteps.slice(0, continuedCount) } : {}),
       ...(result.skip ? { skipped: result.skip } : {}),
+      ...(runtimeLimit
+        ? {
+            updateOffset: result.updateOffset ?? updateOffset,
+            updateLimit: result.updateLimit ?? runtimeLimit,
+            rowCount: result.rowCount ?? 0,
+            hasMore: result.hasMore ?? false,
+          }
+        : {}),
+      ...(diagnostics
+        ? {
+            diagnosticStep,
+            operationMs: operationMs ?? 0,
+            queueMs: queueMs ?? 0,
+            totalMs: Date.now() - startedAt,
+          }
+        : {}),
     };
+    logContinuationDiagnostics(opts.env, continuationResult);
+    return continuationResult;
   }
 
   if (opts.step.step === 'seed') {
-    if (!canSeedShardedFragments(opts.env)) {
-      return { ok: true, step: 'seed', continued: false, skipped: 'seed_disabled' };
-    }
     const monitorLimit = readBoundedMonitorLimit(opts.env, opts.step.monitorLimit);
     const monitorOffset = Math.max(0, Math.floor(opts.step.monitorOffset ?? 0));
+    if (!canSeedShardedFragments(opts.env)) {
+      const skippedResult: ShardedPublicSnapshotContinuationResult = {
+        ok: true,
+        step: 'seed',
+        kind: opts.step.kind,
+        part: opts.step.part,
+        monitorOffset,
+        monitorLimit,
+        continued: false,
+        skipped: 'seed_disabled',
+        ...(diagnostics ? { diagnosticStep, totalMs: Date.now() - startedAt } : {}),
+      };
+      logContinuationDiagnostics(opts.env, skippedResult);
+      return skippedResult;
+    }
+    const operationStartedAt = diagnostics ? Date.now() : 0;
     const result = await seedShardedPublicSnapshotFragments({
       env: opts.env,
       kind: opts.step.kind,
@@ -221,6 +384,7 @@ export async function runShardedPublicSnapshotContinuation(opts: {
       offset: monitorOffset,
       limit: monitorLimit,
     });
+    const operationMs = diagnostics ? Date.now() - operationStartedAt : undefined;
     const nextStep = result.ok
       ? nextSeedStep({
           kind: opts.step.kind,
@@ -230,8 +394,10 @@ export async function runShardedPublicSnapshotContinuation(opts: {
           monitorCount: result.monitorCount,
         })
       : null;
+    const queueStartedAt = diagnostics ? Date.now() : 0;
     const continued = queueContinuation(opts.env, opts.ctx, nextStep);
-    return {
+    const queueMs = diagnostics ? Date.now() - queueStartedAt : undefined;
+    const continuationResult: ShardedPublicSnapshotContinuationResult = {
       ok: result.ok,
       step: 'seed',
       seeded: result.seeded,
@@ -245,20 +411,41 @@ export async function runShardedPublicSnapshotContinuation(opts: {
       ...(continued && nextStep ? { nextStep } : {}),
       ...(result.skipped ? { skipped: result.skipped } : {}),
       ...(result.error ? { error: true } : {}),
+      ...(diagnostics
+        ? {
+            diagnosticStep,
+            operationMs: operationMs ?? 0,
+            queueMs: queueMs ?? 0,
+            totalMs: Date.now() - startedAt,
+          }
+        : {}),
     };
+    logContinuationDiagnostics(opts.env, continuationResult);
+    return continuationResult;
   }
 
   if (!canAssembleShardedSnapshots(opts.env)) {
-    return { ok: true, step: 'assemble', continued: false, skipped: 'assemble_disabled' };
+    const skippedResult: ShardedPublicSnapshotContinuationResult = {
+      ok: true,
+      step: 'assemble',
+      kind: opts.step.kind,
+      continued: false,
+      skipped: 'assemble_disabled',
+      ...(diagnostics ? { diagnosticStep, totalMs: Date.now() - startedAt } : {}),
+    };
+    logContinuationDiagnostics(opts.env, skippedResult);
+    return skippedResult;
   }
+  const operationStartedAt = diagnostics ? Date.now() : 0;
   const result = await assembleShardedPublicSnapshot({
     env: opts.env,
     kind: opts.step.kind,
     mode: readAssemblyMode(opts.env),
+    now: opts.now,
+    publish: shouldPublishShardedSnapshots(opts.env),
   });
-  const nextStep = result.ok ? nextAssembleStep(opts.step.kind) : null;
-  const continued = queueContinuation(opts.env, opts.ctx, nextStep);
-  return {
+  const operationMs = diagnostics ? Date.now() - operationStartedAt : undefined;
+  const continuationResult: ShardedPublicSnapshotContinuationResult = {
     ok: result.ok,
     step: 'assemble',
     assembled: result.assembled,
@@ -266,9 +453,20 @@ export async function runShardedPublicSnapshotContinuation(opts: {
     monitorCount: result.monitorCount,
     invalidCount: result.invalidCount,
     staleCount: result.staleCount,
-    continued,
-    ...(continued && nextStep ? { nextStep } : {}),
+    continued: false,
     ...(result.skip ? { skipped: result.skip } : {}),
+    ...(result.published !== undefined ? { published: result.published } : {}),
+    ...(result.artifactPublished !== undefined
+      ? { artifactPublished: result.artifactPublished }
+      : {}),
+    ...(result.writeCount !== undefined ? { writeCount: result.writeCount } : {}),
     ...(result.error ? { error: true } : {}),
+    ...(result.errorName ? { errorName: result.errorName } : {}),
+    ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+    ...(diagnostics
+      ? { diagnosticStep, operationMs: operationMs ?? 0, totalMs: Date.now() - startedAt }
+      : {}),
   };
+  logContinuationDiagnostics(opts.env, continuationResult);
+  return continuationResult;
 }

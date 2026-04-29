@@ -21,8 +21,17 @@ const READ_FRAGMENTS_SQL = `
   ORDER BY fragment_key
 `;
 
+const READ_FRAGMENTS_PAGE_SQL = `
+  SELECT fragment_key, generated_at, body_json, updated_at
+  FROM public_snapshot_fragments
+  WHERE snapshot_key = ?1
+  ORDER BY fragment_key
+  LIMIT ?2 OFFSET ?3
+`;
+
 const upsertFragmentStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const readFragmentsStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+const readFragmentsPageStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 
 export type PublicSnapshotFragmentWrite = {
   snapshotKey: string;
@@ -48,6 +57,18 @@ function assertFragmentText(value: string, label: string): void {
 function assertFiniteTimestamp(value: number, label: string): void {
   if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
     throw new Error(`public snapshot fragment ${label} must be a non-negative integer`);
+  }
+}
+
+function assertNonNegativeInteger(value: number, label: string): void {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+    throw new Error(`public snapshot fragment ${label} must be a non-negative integer`);
+  }
+}
+
+function assertPositiveInteger(value: number, label: string): void {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`public snapshot fragment ${label} must be a positive integer`);
   }
 }
 
@@ -101,5 +122,26 @@ export async function readPublicSnapshotFragments(
   }
 
   const { results } = await statement.bind(snapshotKey).all<PublicSnapshotFragmentRow>();
+  return results ?? [];
+}
+
+export async function readPublicSnapshotFragmentsPage(
+  db: D1Database,
+  snapshotKey: string,
+  opts: { offset: number; limit: number },
+): Promise<PublicSnapshotFragmentRow[]> {
+  assertFragmentText(snapshotKey, 'snapshotKey');
+  assertNonNegativeInteger(opts.offset, 'offset');
+  assertPositiveInteger(opts.limit, 'limit');
+
+  const cached = readFragmentsPageStatementByDb.get(db);
+  const statement = cached ?? db.prepare(READ_FRAGMENTS_PAGE_SQL);
+  if (!cached) {
+    readFragmentsPageStatementByDb.set(db, statement);
+  }
+
+  const { results } = await statement
+    .bind(snapshotKey, opts.limit, opts.offset)
+    .all<PublicSnapshotFragmentRow>();
   return results ?? [];
 }
