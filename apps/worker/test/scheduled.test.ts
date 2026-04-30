@@ -595,6 +595,104 @@ describe('scheduler/scheduled regression', () => {
     logSpy.mockRestore();
   });
 
+  it('can split runtime update fragment writes out of check-batch children', async () => {
+    const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
+    const dueRows = Array.from({ length: 7 }, (_, index) => ({
+      id: index + 1,
+      name: `API ${index + 1}`,
+      type: 'http',
+      target: `https://example.com/${index + 1}`,
+      interval_sec: 60,
+      created_at: 1_760_000_000 + index,
+      timeout_ms: 10_000,
+      http_method: 'GET',
+      http_headers_json: null,
+      http_body: null,
+      expected_status_json: null,
+      response_keyword: null,
+      response_keyword_mode: null,
+      response_forbidden_keyword: null,
+      response_forbidden_keyword_mode: null,
+      state_status: 'up',
+      state_last_error: null,
+      last_checked_at: checkedAt - 60,
+      last_changed_at: 1_760_000_000,
+      consecutive_failures: 0,
+      consecutive_successes: 1,
+    }));
+    const env = createEnv({ dueRows }) as unknown as Env;
+    env.ADMIN_TOKEN = 'test-admin-token';
+    env.UPTIMER_PUBLIC_MONITOR_UPDATE_FRAGMENT_WRITES = '1';
+    env.UPTIMER_SCHEDULED_RUNTIME_FRAGMENT_REFRESH = '1';
+    env.UPTIMER_INTERNAL_CHECK_BATCH_FRAGMENT_WRITE_SPLIT = '1';
+    const writerBodies: unknown[] = [];
+    const selfFetch = vi.fn(async (request: Request) => {
+      const path = new URL(request.url).pathname;
+      if (path === '/api/v1/internal/scheduled/check-batch') {
+        expect(request.headers.get('X-Uptimer-Runtime-Fragments-Only')).toBeNull();
+        const body = (await request.json()) as { ids: number[]; checked_at: number };
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            runtime_updates: body.ids.map((id) => [
+              id,
+              60,
+              1_760_000_000 + id,
+              body.checked_at,
+              'up',
+              'up',
+              21,
+            ]),
+            processed_count: body.ids.length,
+            rejected_count: 0,
+            attempt_total: body.ids.length,
+            http_count: body.ids.length,
+            tcp_count: 0,
+            assertion_count: 0,
+            down_count: 0,
+            unknown_count: 0,
+            checks_duration_ms: 4,
+            persist_duration_ms: 2,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json; charset=utf-8' } },
+        );
+      }
+      if (path === '/api/v1/internal/write/runtime-update-fragments') {
+        writerBodies.push(await request.json());
+        return new Response(JSON.stringify({ ok: true, written: true, write_count: 1 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        });
+      }
+      if (path === '/api/v1/internal/refresh/runtime-fragments') {
+        return new Response(
+          JSON.stringify({ ok: true, refreshed: true, update_count: 7 }),
+          { status: 200, headers: { 'Content-Type': 'application/json; charset=utf-8' } },
+        );
+      }
+      if (path === '/api/v1/internal/refresh/homepage') {
+        return new Response(JSON.stringify({ ok: true, refreshed: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        });
+      }
+      throw new Error(`unexpected self fetch: ${path}`);
+    });
+    env.SELF = { fetch: selfFetch } as unknown as Fetcher;
+    const waitUntil = vi.fn();
+
+    await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+    const requests = selfFetch.mock.calls.map((call) => call[0] as Request);
+    expect(requests.filter((request) => new URL(request.url).pathname === '/api/v1/internal/scheduled/check-batch')).toHaveLength(2);
+    expect(requests.filter((request) => new URL(request.url).pathname === '/api/v1/internal/write/runtime-update-fragments')).toHaveLength(1);
+    expect(writerBodies).toEqual([
+      { runtime_updates: [[1, 60, 1_760_000_001, checkedAt, 'up', 'up', 21], [2, 60, 1_760_000_002, checkedAt, 'up', 'up', 21], [3, 60, 1_760_000_003, checkedAt, 'up', 'up', 21], [4, 60, 1_760_000_004, checkedAt, 'up', 'up', 21], [5, 60, 1_760_000_005, checkedAt, 'up', 'up', 21], [6, 60, 1_760_000_006, checkedAt, 'up', 'up', 21], [7, 60, 1_760_000_007, checkedAt, 'up', 'up', 21]] },
+    ]);
+    expect(refreshPublicMonitorRuntimeSnapshot).not.toHaveBeenCalled();
+  });
+
   it('uses the equivalent direct homepage refresh core when the direct gate is enabled', async () => {
     const env = createEnv({ dueRows: [] }) as unknown as Env;
     env.ADMIN_TOKEN = 'test-admin-token';
@@ -1599,6 +1697,57 @@ describe('scheduler/scheduled regression', () => {
 
     await expect(batchPromise).rejects.toBeInstanceOf(LeaseLostError);
     expect(persistedWrites).toBe(0);
+  });
+
+  it('can trust the scheduler lease and skip per-batch execution locks', async () => {
+    const checkedAt = Math.floor(Math.floor(Date.now() / 1000) / 60) * 60;
+    const env = createEnv({
+      dueRows: [
+        {
+          id: 1,
+          name: 'API 1',
+          type: 'http',
+          target: 'https://example.com/1',
+          interval_sec: 60,
+          created_at: 1_760_000_001,
+          timeout_ms: 10_000,
+          http_method: 'GET',
+          http_headers_json: null,
+          http_body: null,
+          expected_status_json: null,
+          response_keyword: null,
+          response_keyword_mode: null,
+          response_forbidden_keyword: null,
+          response_forbidden_keyword_mode: null,
+          state_status: 'up',
+          state_last_error: null,
+          last_checked_at: checkedAt - 60,
+          last_changed_at: 1_760_000_000,
+          consecutive_failures: 0,
+          consecutive_successes: 1,
+        },
+      ],
+    });
+
+    const result = await runExclusivePersistedMonitorBatch({
+      db: env.DB,
+      ids: [1],
+      checkedAt,
+      trustSchedulerLease: true,
+      stateMachineConfig: {
+        failuresToDownFromUp: 2,
+        successesToUpFromDown: 2,
+      },
+    });
+
+    expect(acquireLease).not.toHaveBeenCalledWith(
+      env.DB,
+      expect.stringContaining('scheduler:batch:'),
+      expect.any(Number),
+      expect.any(Number),
+    );
+    expect(runHttpCheck).toHaveBeenCalledTimes(1);
+    expect(result.runtimeUpdates).toMatchObject([{ monitor_id: 1 }]);
   });
 
   it('skips monitor ids already claimed by an overlapping batch execution', async () => {

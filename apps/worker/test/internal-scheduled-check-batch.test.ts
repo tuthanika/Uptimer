@@ -10,6 +10,86 @@ import { LeaseLostError } from '../src/scheduler/lease-guard';
 import { runExclusivePersistedMonitorBatch } from '../src/scheduler/scheduled';
 import { createFakeD1Database } from './helpers/fake-d1';
 
+describe('internal runtime update fragment write route', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.clearAllMocks();
+  });
+
+  it('is hidden unless monitor update fragment writes are enabled', async () => {
+    const env = {
+      DB: createFakeD1Database([]),
+      ADMIN_TOKEN: 'test-admin-token',
+    } as unknown as Env;
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/write/runtime-update-fragments', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({ runtime_updates: [] }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(404);
+  });
+
+  it('writes compact monitor runtime update fragments behind the internal flag', async () => {
+    const now = new Date('2026-04-15T05:18:20.000Z').valueOf();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const writes: unknown[][] = [];
+    const env = {
+      DB: createFakeD1Database([
+        {
+          match: 'insert into public_snapshot_fragments',
+          run: (args) => {
+            writes.push(args);
+            return { meta: { changes: 1 } };
+          },
+        },
+      ]),
+      ADMIN_TOKEN: 'test-admin-token',
+      UPTIMER_PUBLIC_MONITOR_UPDATE_FRAGMENT_WRITES: '1',
+    } as unknown as Env;
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/write/runtime-update-fragments', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({
+          runtime_updates: [[1, 60, 1_776_230_000, 1_776_230_280, 'up', 'up', 21]],
+        }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toMatchObject({
+      ok: true,
+      written: true,
+      update_count: 1,
+      write_count: 1,
+    });
+    expect(writes).toEqual([
+      [
+        'monitor-runtime:updates',
+        'monitor:1',
+        1_776_230_280,
+        '[1,60,1776230000,1776230280,"up","up",21]',
+        1_776_230_300,
+      ],
+    ]);
+  });
+});
+
 describe('internal scheduled check-batch route', () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -324,6 +404,58 @@ describe('internal scheduled check-batch route', () => {
         1_776_230_300,
       ],
     ]);
+  });
+
+  it('passes trusted scheduler lease mode behind the internal flag', async () => {
+    const now = new Date('2026-04-15T05:18:20.000Z').valueOf();
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    vi.mocked(runExclusivePersistedMonitorBatch).mockResolvedValue({
+      runtimeUpdates: [],
+      stats: {
+        processedCount: 1,
+        rejectedCount: 0,
+        attemptTotal: 1,
+        httpCount: 1,
+        tcpCount: 0,
+        assertionCount: 0,
+        downCount: 0,
+        unknownCount: 0,
+      },
+      checksDurMs: 4,
+      persistDurMs: 2,
+    });
+
+    const env = {
+      DB: createFakeD1Database([]),
+      ADMIN_TOKEN: 'test-admin-token',
+      UPTIMER_INTERNAL_CHECK_BATCH_TRUST_SCHEDULER_LEASE: '1',
+    } as unknown as Env;
+
+    const res = await worker.fetch(
+      new Request('http://internal/api/v1/internal/scheduled/check-batch', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer test-admin-token',
+          'Content-Type': 'application/json; charset=utf-8',
+        },
+        body: JSON.stringify({
+          token: 'test-admin-token',
+          ids: [1],
+          checked_at: 1_776_230_280,
+          state_failures_to_down_from_up: 2,
+          state_successes_to_up_from_down: 2,
+        }),
+      }),
+      env,
+      { waitUntil: vi.fn() } as unknown as ExecutionContext,
+    );
+
+    expect(res.status).toBe(200);
+    expect(runExclusivePersistedMonitorBatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        trustSchedulerLease: true,
+      }),
+    );
   });
 
   it('emits bounded check-batch diagnostics when explicitly enabled', async () => {

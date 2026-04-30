@@ -9,7 +9,10 @@ vi.mock('../src/scheduler/lock', () => ({
 import { acquireLease, releaseLease, renewLease } from '../src/scheduler/lock';
 import {
   applyHomepageCacheHeaders,
+  buildHomepageArtifactMonitorFragmentWrites,
   buildHomepageRenderArtifact,
+  buildHomepageRenderArtifactFromMonitorFragments,
+  HOMEPAGE_ARTIFACT_MONITOR_FRAGMENTS_KEY,
   getHomepageSnapshotKey,
   getHomepageSnapshotMaxAgeSeconds,
   getHomepageSnapshotMaxStaleSeconds,
@@ -123,6 +126,71 @@ describe('snapshots/public-homepage', () => {
     if ('snapshot' in artifact) {
       expect(artifact.snapshot).toEqual(payload);
     }
+  });
+
+  it('builds pre-rendered homepage artifact monitor fragments', () => {
+    const payload = samplePayload(190);
+    payload.monitors[0] = {
+      ...payload.monitors[0],
+      name: '<API & edge>',
+      group_name: 'Core',
+    };
+
+    const writes = buildHomepageArtifactMonitorFragmentWrites(payload, 200, [1]);
+
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({
+      snapshotKey: HOMEPAGE_ARTIFACT_MONITOR_FRAGMENTS_KEY,
+      fragmentKey: 'monitor:1',
+      generatedAt: 190,
+      updatedAt: 200,
+    });
+    const body = JSON.parse(writes[0].bodyJson) as {
+      id: number;
+      name: string;
+      group_name: string | null;
+      card_html: string;
+    };
+    expect(body.id).toBe(1);
+    expect(body.name).toBe('<API & edge>');
+    expect(body.group_name).toBe('Core');
+    expect(body.card_html).toContain('&lt;API &amp; edge&gt;');
+    expect(body.card_html).toContain('Availability (30d)');
+    expect(body.card_html).toContain('<path d="M');
+    expect(body.card_html).not.toContain('<rect ');
+  });
+
+  it('builds homepage artifacts from pre-rendered monitor fragments', () => {
+    const payload = samplePayload(190);
+    const rows = buildHomepageArtifactMonitorFragmentWrites(payload, 200).map((write) => {
+      const body = JSON.parse(write.bodyJson) as { card_html: string };
+      return {
+        fragment_key: write.fragmentKey,
+        generated_at: write.generatedAt,
+        body_json: JSON.stringify({
+          ...body,
+          card_html: '<article class="card">PRE-RENDERED API</article>',
+        }),
+        updated_at: write.updatedAt,
+      };
+    });
+
+    const result = buildHomepageRenderArtifactFromMonitorFragments(payload, rows);
+
+    expect(result.missingCount).toBe(0);
+    expect(result.staleCount).toBe(0);
+    expect(result.invalidCount).toBe(0);
+    expect(result.artifact?.preload_html).toContain('PRE-RENDERED API');
+    expect(result.artifact?.snapshot).toEqual(payload);
+  });
+
+  it('rejects incomplete homepage artifact monitor fragments', () => {
+    const payload = samplePayload(190);
+
+    const result = buildHomepageRenderArtifactFromMonitorFragments(payload, []);
+
+    expect(result.artifact).toBeNull();
+    expect(result.missingCount).toBe(1);
   });
 
   it('reads fresh and bounded-stale homepage snapshots without live compute', async () => {

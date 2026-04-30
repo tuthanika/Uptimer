@@ -273,6 +273,48 @@ describe('public homepage route', () => {
     expect(await res.json()).toEqual(render);
   });
 
+  it('keeps current artifact rows available when their body generation is old but updated_at is fresh', async () => {
+    const payload = samplePayload(100);
+    const render = {
+      generated_at: payload.generated_at,
+      preload_html: '<div id="uptimer-preload">hello</div>',
+      snapshot_json: JSON.stringify(payload),
+      meta_title: 'Uptimer',
+      meta_description: 'All Systems Operational',
+    };
+    vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+
+    const res = await requestHomepageArtifact([
+      {
+        match: (sql) =>
+          sql.includes('select generated_at, updated_at') &&
+          sql.includes('from public_snapshots') &&
+          !sql.includes('body_json'),
+        first: (args) =>
+          args[0] === 'homepage:artifact'
+            ? {
+                generated_at: payload.generated_at,
+                updated_at: 995,
+              }
+            : null,
+      },
+      {
+        match: 'from public_snapshots',
+        first: (args) =>
+          args[0] === 'homepage:artifact'
+            ? {
+                generated_at: payload.generated_at,
+                updated_at: 995,
+                body_json: JSON.stringify(render),
+              }
+            : null,
+      },
+    ]);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(render);
+  });
+
   it('falls back to the legacy combined homepage row for artifacts during rollout', async () => {
     const payload = samplePayload(190);
     const render = {

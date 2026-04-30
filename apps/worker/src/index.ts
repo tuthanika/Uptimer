@@ -200,6 +200,10 @@ const internalRefreshJsonBodySchema = z.object({
   runtime_updates: z.array(z.unknown()).optional(),
 });
 
+const internalRuntimeUpdateFragmentsWriteBodySchema = z.object({
+  runtime_updates: z.array(z.unknown()),
+});
+
 const internalShardedPublicSnapshotBodySchema = z.object({
   kind: z.enum(['homepage', 'status']),
   assembly: z.enum(['validated', 'json']).optional().default('validated'),
@@ -230,6 +234,11 @@ const internalShardedPublicSnapshotContinuationBodySchema = z.discriminatedUnion
   z.object({
     step: z.literal('assemble'),
     kind: z.enum(['homepage', 'status']),
+  }),
+  z.object({
+    step: z.literal('artifact'),
+    kind: z.literal('homepage'),
+    generated_at: z.number().int().min(0).optional(),
   }),
 ]);
 
@@ -278,7 +287,9 @@ function parseInternalRefreshRuntimeUpdates(
   return runtimeUpdates ? { runtime_updates: runtimeUpdates } : null;
 }
 
-function parseInternalScheduledCheckBatchBody(value: unknown): InternalScheduledCheckBatchBody | null {
+function parseInternalScheduledCheckBatchBody(
+  value: unknown,
+): InternalScheduledCheckBatchBody | null {
   if (!isRecord(value)) {
     return null;
   }
@@ -306,10 +317,7 @@ function parseInternalScheduledCheckBatchBody(value: unknown): InternalScheduled
   ) {
     return null;
   }
-  if (
-    value.allow_notifications !== undefined &&
-    typeof value.allow_notifications !== 'boolean'
-  ) {
+  if (value.allow_notifications !== undefined && typeof value.allow_notifications !== 'boolean') {
     return null;
   }
 
@@ -421,13 +429,17 @@ async function handleInternalHomepageRefresh(request: Request, env: Env): Promis
 
   if (trace?.enabled && traceResidualDetails) {
     trace.setLabel('request_content_length', request.headers.get('Content-Length') ?? 'unknown');
-    trace.setLabel('internal_format', wantsCompactInternalFormat(request) ? 'compact-v1' : 'default');
+    trace.setLabel(
+      'internal_format',
+      wantsCompactInternalFormat(request) ? 'compact-v1' : 'default',
+    );
   }
 
   if (contentType.includes('application/json')) {
     const rawBody = detailTrace
-      ? await detailTrace.timeAsync('homepage_refresh_body_json_read', async () =>
-          await request.json().catch(() => null),
+      ? await detailTrace.timeAsync(
+          'homepage_refresh_body_json_read',
+          async () => await request.json().catch(() => null),
         )
       : await request.json().catch(() => null);
     const parseBody = () =>
@@ -498,9 +510,7 @@ async function handleInternalShardedPublicSnapshotAssemble(
     return new Response('Bad Request', { status: 400 });
   }
 
-  const { assembleShardedPublicSnapshot } = await import(
-    './internal/sharded-public-snapshot-core'
-  );
+  const { assembleShardedPublicSnapshot } = await import('./internal/sharded-public-snapshot-core');
   const canPublish =
     parsed.data.publish &&
     normalizeTruthyHeader(env.UPTIMER_PUBLIC_SHARDED_SNAPSHOT_PUBLISH ?? null);
@@ -563,9 +573,8 @@ async function handleInternalShardedPublicSnapshotSeed(
     return new Response('Bad Request', { status: 400 });
   }
 
-  const { seedShardedPublicSnapshotFragments } = await import(
-    './internal/sharded-public-snapshot-core'
-  );
+  const { seedShardedPublicSnapshotFragments } =
+    await import('./internal/sharded-public-snapshot-core');
   const result = await seedShardedPublicSnapshotFragments({
     env,
     kind: parsed.data.kind,
@@ -618,32 +627,40 @@ async function handleInternalShardedPublicSnapshotContinuation(
     return new Response('Bad Request', { status: 400 });
   }
 
-  const { runShardedPublicSnapshotContinuation } = await import(
-    './internal/sharded-public-snapshot-continuation'
-  );
+  const { runShardedPublicSnapshotContinuation } =
+    await import('./internal/sharded-public-snapshot-continuation');
   const result = await runShardedPublicSnapshotContinuation({
     env,
     ctx,
     now: Math.floor(Date.now() / 1000),
-    step: parsed.data.step === 'runtime'
-      ? {
-          step: 'runtime',
-          ...(parsed.data.update_offset !== undefined
-            ? { updateOffset: parsed.data.update_offset }
-            : {}),
-          ...(parsed.data.update_limit !== undefined
-            ? { updateLimit: parsed.data.update_limit }
-            : {}),
-        }
-      : parsed.data.step === 'assemble'
-        ? { step: 'assemble', kind: parsed.data.kind }
-        : {
-            step: 'seed',
-            kind: parsed.data.kind,
-            part: parsed.data.part,
-            monitorOffset: parsed.data.monitor_offset,
-            monitorLimit: parsed.data.monitor_limit,
-          },
+    step:
+      parsed.data.step === 'runtime'
+        ? {
+            step: 'runtime',
+            ...(parsed.data.update_offset !== undefined
+              ? { updateOffset: parsed.data.update_offset }
+              : {}),
+            ...(parsed.data.update_limit !== undefined
+              ? { updateLimit: parsed.data.update_limit }
+              : {}),
+          }
+        : parsed.data.step === 'assemble'
+          ? { step: 'assemble', kind: parsed.data.kind }
+          : parsed.data.step === 'artifact'
+            ? {
+                step: 'artifact',
+                kind: 'homepage',
+                ...(parsed.data.generated_at !== undefined
+                  ? { generatedAt: parsed.data.generated_at }
+                  : {}),
+              }
+            : {
+                step: 'seed',
+                kind: parsed.data.kind,
+                part: parsed.data.part,
+                monitorOffset: parsed.data.monitor_offset,
+                monitorLimit: parsed.data.monitor_limit,
+              },
   });
   const toResponseStep = (step: NonNullable<typeof result.nextStep>) =>
     step.step === 'runtime'
@@ -654,13 +671,19 @@ async function handleInternalShardedPublicSnapshotContinuation(
         }
       : step.step === 'assemble'
         ? { step: 'assemble', kind: step.kind }
-        : {
-            step: 'seed',
-            kind: step.kind,
-            part: step.part,
-            monitor_offset: step.monitorOffset ?? 0,
-            monitor_limit: step.monitorLimit ?? 5,
-          };
+        : step.step === 'artifact'
+          ? {
+              step: 'artifact',
+              kind: step.kind,
+              ...(step.generatedAt !== undefined ? { generated_at: step.generatedAt } : {}),
+            }
+          : {
+              step: 'seed',
+              kind: step.kind,
+              part: step.part,
+              monitor_offset: step.monitorOffset ?? 0,
+              monitor_limit: step.monitorLimit ?? 5,
+            };
   const nextStep = result.nextStep ? toResponseStep(result.nextStep) : undefined;
   const nextSteps = result.nextSteps?.map(toResponseStep);
   return buildInternalJsonResponse(
@@ -677,6 +700,7 @@ async function handleInternalShardedPublicSnapshotContinuation(
         : {}),
       ...(result.kind ? { kind: result.kind } : {}),
       ...(result.part ? { part: result.part } : {}),
+      ...(result.generatedAt !== undefined ? { generated_at: result.generatedAt } : {}),
       ...(result.monitorCount !== undefined ? { monitor_count: result.monitorCount } : {}),
       ...(result.monitorOffset !== undefined ? { monitor_offset: result.monitorOffset } : {}),
       ...(result.monitorLimit !== undefined ? { monitor_limit: result.monitorLimit } : {}),
@@ -702,6 +726,58 @@ async function handleInternalShardedPublicSnapshotContinuation(
   );
 }
 
+async function handleInternalRuntimeUpdateFragmentsWrite(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (!isInternalServiceRequest(request)) {
+    return buildNotFoundJsonResponse(request.headers.get('Origin'));
+  }
+  if (request.method !== 'POST') {
+    return new Response('Method Not Allowed', { status: 405 });
+  }
+  if (!normalizeTruthyHeader(env.UPTIMER_PUBLIC_MONITOR_UPDATE_FRAGMENT_WRITES ?? null)) {
+    return buildNotFoundJsonResponse(request.headers.get('Origin'));
+  }
+  if (!hasValidInternalAuth(request, env)) {
+    return new Response('Forbidden', { status: 403 });
+  }
+  if (isRequestBodyTooLarge(request)) {
+    return new Response('Payload Too Large', { status: 413 });
+  }
+
+  const body = await request.json().catch(() => null);
+  const parsed = internalRuntimeUpdateFragmentsWriteBodySchema.safeParse(body);
+  if (!parsed.success) {
+    return new Response('Bad Request', { status: 400 });
+  }
+  const updates = parseMonitorRuntimeUpdates(parsed.data.runtime_updates);
+  if (!updates) {
+    return new Response('Bad Request', { status: 400 });
+  }
+
+  const [{ buildMonitorRuntimeUpdateFragmentWrites }, { writePublicSnapshotFragments }] =
+    await Promise.all([
+      import('./snapshots/public-monitor-fragments'),
+      import('./snapshots/public-fragments'),
+    ]);
+  const now = Math.floor(Date.now() / 1000);
+  const fragmentWrites = buildMonitorRuntimeUpdateFragmentWrites(updates, now);
+  if (fragmentWrites.length > 0) {
+    await writePublicSnapshotFragments(env.DB, fragmentWrites);
+  }
+
+  return buildInternalJsonResponse(
+    {
+      ok: true,
+      written: fragmentWrites.length > 0,
+      update_count: updates.length,
+      write_count: fragmentWrites.length,
+    },
+    true,
+  );
+}
+
 async function handleInternalRuntimeFragmentsRefresh(
   request: Request,
   env: Env,
@@ -719,9 +795,8 @@ async function handleInternalRuntimeFragmentsRefresh(
     return new Response('Payload Too Large', { status: 413 });
   }
 
-  const { refreshMonitorRuntimeSnapshotFromUpdateFragments } = await import(
-    './internal/runtime-fragments-refresh-core'
-  );
+  const { refreshMonitorRuntimeSnapshotFromUpdateFragments } =
+    await import('./internal/runtime-fragments-refresh-core');
   const result = await refreshMonitorRuntimeSnapshotFromUpdateFragments({
     env,
     now: Math.floor(Date.now() / 1000),
@@ -805,29 +880,33 @@ async function handleInternalScheduledCheckBatch(
 
   const ids = [...new Set(parsedBody.ids)];
   const suppressedMonitorIds = new Set(parsedBody.suppressed_monitor_ids ?? []);
-  const [{ runExclusivePersistedMonitorBatch }, notificationsModule] = await timeInternalCheckBatchDiagnostic(
-    diagnosticsEnabled,
-    diagnosticsTimings,
-    'imports',
-    async () =>
-      await (trace
-        ? trace.timeAsync(
-            'check_batch_import_modules',
-            async () =>
-              await Promise.all([
-                import('./scheduler/scheduled'),
-                parsedBody.allow_notifications === true
-                  ? import('./scheduler/notifications')
-                  : Promise.resolve(null),
-              ]),
-          )
-        : Promise.all([
-            import('./scheduler/scheduled'),
-            parsedBody.allow_notifications === true
-              ? import('./scheduler/notifications')
-              : Promise.resolve(null),
-          ])),
+  const trustSchedulerLease = normalizeTruthyHeader(
+    env.UPTIMER_INTERNAL_CHECK_BATCH_TRUST_SCHEDULER_LEASE ?? null,
   );
+  const [{ runExclusivePersistedMonitorBatch }, notificationsModule] =
+    await timeInternalCheckBatchDiagnostic(
+      diagnosticsEnabled,
+      diagnosticsTimings,
+      'imports',
+      async () =>
+        await (trace
+          ? trace.timeAsync(
+              'check_batch_import_modules',
+              async () =>
+                await Promise.all([
+                  import('./scheduler/scheduled'),
+                  parsedBody.allow_notifications === true
+                    ? import('./scheduler/notifications')
+                    : Promise.resolve(null),
+                ]),
+            )
+          : Promise.all([
+              import('./scheduler/scheduled'),
+              parsedBody.allow_notifications === true
+                ? import('./scheduler/notifications')
+                : Promise.resolve(null),
+            ])),
+    );
 
   const notify = notificationsModule
     ? await timeInternalCheckBatchDiagnostic(
@@ -852,6 +931,7 @@ async function handleInternalScheduledCheckBatch(
         checkedAt: parsedBody.checked_at,
         abortSignal: request.signal,
         suppressedMonitorIds,
+        trustSchedulerLease,
         stateMachineConfig: {
           failuresToDownFromUp: parsedBody.state_failures_to_down_from_up,
           successesToUpFromDown: parsedBody.state_successes_to_up_from_down,
@@ -873,22 +953,32 @@ async function handleInternalScheduledCheckBatch(
   } catch (err) {
     if (err instanceof LeaseLostError) {
       console.warn(err.message);
-      return finalizeInternalCheckBatchResponse(new Response('Service Unavailable', {
-        status: 503,
+      return finalizeInternalCheckBatchResponse(
+        new Response('Service Unavailable', {
+          status: 503,
+          headers: {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Cache-Control': 'no-store',
+          },
+        }),
+        trace,
+        traceMod,
+        { ok: false },
+      );
+    }
+    console.error('internal scheduled check batch failed', err);
+    return finalizeInternalCheckBatchResponse(
+      new Response('Internal Server Error', {
+        status: 500,
         headers: {
           'Content-Type': 'text/plain; charset=utf-8',
           'Cache-Control': 'no-store',
         },
-      }), trace, traceMod, { ok: false });
-    }
-    console.error('internal scheduled check batch failed', err);
-    return finalizeInternalCheckBatchResponse(new Response('Internal Server Error', {
-      status: 500,
-      headers: {
-        'Content-Type': 'text/plain; charset=utf-8',
-        'Cache-Control': 'no-store',
-      },
-    }), trace, traceMod, { ok: false, error: true });
+      }),
+      trace,
+      traceMod,
+      { ok: false, error: true },
+    );
   }
 
   const monitorUpdateFragmentWritesEnabled = normalizeTruthyHeader(
@@ -981,16 +1071,18 @@ async function handleInternalScheduledCheckBatch(
     checksDurMs: result.checksDurMs,
     persistDurMs: result.persistDurMs,
   });
-  return finalizeInternalCheckBatchResponse(new Response(
-    bodyText,
-    {
+  return finalizeInternalCheckBatchResponse(
+    new Response(bodyText, {
       status: 200,
       headers: {
         'Content-Type': 'application/json; charset=utf-8',
         'Cache-Control': 'no-store',
       },
-    },
-  ), trace, traceMod, { ok: true });
+    }),
+    trace,
+    traceMod,
+    { ok: true },
+  );
 }
 
 export default {
@@ -1004,6 +1096,9 @@ export default {
     }
     if (url.pathname === '/api/v1/internal/refresh/runtime-fragments') {
       return handleInternalRuntimeFragmentsRefresh(request, env);
+    }
+    if (url.pathname === '/api/v1/internal/write/runtime-update-fragments') {
+      return handleInternalRuntimeUpdateFragmentsWrite(request, env);
     }
     if (url.pathname === '/api/v1/internal/assemble/sharded-public-snapshot') {
       return handleInternalShardedPublicSnapshotAssemble(request, env);
@@ -1019,14 +1114,46 @@ export default {
     return mod.handleFetch(request, env, ctx);
   },
   scheduled: async (controller: ScheduledController, env: Env, ctx: ExecutionContext) => {
-    if (controller.cron === '0 0 * * *') {
-      const { runDailyRollup } = await import('./scheduler/daily-rollup');
-      await runDailyRollup(env, controller, ctx);
-      return;
+    const scheduledAt = controller.scheduledTime ?? Date.now();
+    const scheduledDate = new Date(scheduledAt);
+    const isConsolidatedMinuteCron = controller.cron === '* * * * *';
+    const isLegacyDailyRollupCron = controller.cron === '0 0 * * *';
+    const isLegacyRetentionCron = controller.cron === '30 0 * * *';
+    const shouldRunDailyRollup =
+      isLegacyDailyRollupCron ||
+      (isConsolidatedMinuteCron &&
+        scheduledDate.getUTCHours() === 0 &&
+        scheduledDate.getUTCMinutes() === 0);
+    const shouldRunRetention =
+      isLegacyRetentionCron ||
+      (isConsolidatedMinuteCron &&
+        scheduledDate.getUTCHours() === 0 &&
+        scheduledDate.getUTCMinutes() === 30);
+
+    // Keep legacy cron branches during Cloudflare's trigger propagation window,
+    // but only the consolidated minute cron runs the monitor tick.
+    if (shouldRunDailyRollup) {
+      ctx.waitUntil(
+        (async () => {
+          const { runDailyRollup } = await import('./scheduler/daily-rollup');
+          await runDailyRollup(env, controller, ctx);
+        })().catch((err) => {
+          console.error('scheduled: daily rollup failed', err);
+        }),
+      );
     }
-    if (controller.cron === '30 0 * * *') {
-      const { runRetention } = await import('./scheduler/retention');
-      await runRetention(env, controller);
+    if (shouldRunRetention) {
+      ctx.waitUntil(
+        (async () => {
+          const { runRetention } = await import('./scheduler/retention');
+          await runRetention(env, controller);
+        })().catch((err) => {
+          console.error('scheduled: retention failed', err);
+        }),
+      );
+    }
+
+    if (isLegacyDailyRollupCron || isLegacyRetentionCron) {
       return;
     }
 

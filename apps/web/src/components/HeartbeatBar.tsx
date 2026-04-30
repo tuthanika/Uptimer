@@ -366,6 +366,7 @@ export function HeartbeatBar({
         />
         {tooltip && (
           <div
+            key={`heartbeat-overlay-${tooltip.index}-${tooltip.heartbeat.from_checked_at}-${tooltip.heartbeat.to_checked_at}`}
             className="pointer-events-none absolute inset-y-0 rounded-sm ring-1 ring-white/70 shadow-[0_0_0_1px_rgba(15,23,42,0.08)]"
             style={{
               left: `${(tooltip.index / slotCount) * 100}%`,

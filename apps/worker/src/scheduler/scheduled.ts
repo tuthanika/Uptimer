@@ -120,6 +120,7 @@ type ScheduledCheckBatchServiceContext = {
   };
   allowNotifications: boolean;
   runtimeFragmentsOnly?: boolean;
+  splitRuntimeFragmentWrites?: boolean;
 };
 
 function readScheduledTraceToken(env: Env): string | null {
@@ -153,6 +154,20 @@ function shouldTraceScheduledRefresh(env: Env): boolean {
   );
 }
 
+function shouldLogScheduledRefresh(env: Env): boolean {
+  const raw = (env as unknown as Record<string, unknown>).UPTIMER_SCHEDULED_REFRESH_LOGS;
+  if (typeof raw !== 'string') {
+    return true;
+  }
+  const normalized = raw.trim().toLowerCase();
+  return !(
+    normalized === '0' ||
+    normalized === 'false' ||
+    normalized === 'no' ||
+    normalized === 'off'
+  );
+}
+
 function shouldRefreshHomepageDirect(env: Env): boolean {
   const rawEnv = env as unknown as Record<string, unknown>;
   return isTruthyEnvFlag(rawEnv.UPTIMER_SCHEDULED_HOMEPAGE_DIRECT);
@@ -170,6 +185,11 @@ function shouldUseScheduledRuntimeFragmentPipeline(env: Env): boolean {
     shouldRefreshRuntimeFragmentsViaService(env) &&
     isTruthyEnvFlag(rawEnv.UPTIMER_PUBLIC_MONITOR_UPDATE_FRAGMENT_WRITES)
   );
+}
+
+function shouldSplitInternalCheckBatchFragmentWrites(env: Env): boolean {
+  const rawEnv = env as unknown as Record<string, unknown>;
+  return isTruthyEnvFlag(rawEnv.UPTIMER_INTERNAL_CHECK_BATCH_FRAGMENT_WRITE_SPLIT);
 }
 
 function shouldSeedScheduledShardedFragments(env: Env): boolean {
@@ -252,6 +272,40 @@ async function fetchSelfWithTimeout(
   } finally {
     signal?.removeEventListener('abort', abortFromParent);
     clearTimeout(timeout);
+  }
+}
+
+async function writeRuntimeUpdateFragmentsViaService(
+  env: Env,
+  runtimeUpdates: readonly MonitorRuntimeUpdate[],
+  signal?: AbortSignal,
+): Promise<void> {
+  if (runtimeUpdates.length === 0) {
+    return;
+  }
+  if (!env.ADMIN_TOKEN) {
+    throw new Error('ADMIN_TOKEN missing');
+  }
+
+  const res = await fetchSelfWithTimeout(
+    env,
+    new Request('http://internal/api/v1/internal/write/runtime-update-fragments', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.ADMIN_TOKEN}`,
+        'Content-Type': 'application/json; charset=utf-8',
+      },
+      body: JSON.stringify({
+        runtime_updates: encodeMonitorRuntimeUpdatesCompact(runtimeUpdates),
+      }),
+    }),
+    RUNTIME_FRAGMENTS_REFRESH_SERVICE_TIMEOUT_MS,
+    'runtime update fragments write service',
+    signal,
+  );
+  const bodyText = await res.text().catch(() => '');
+  if (!res.ok) {
+    throw new Error(`runtime update fragments write failed: HTTP ${res.status} ${bodyText}`.trim());
   }
 }
 
@@ -517,11 +571,13 @@ async function startShardedPublicSnapshotContinuationViaService(
   if (!res.ok) {
     throw new Error(`sharded public snapshot continuation failed: HTTP ${res.status} ${bodyText}`.trim());
   }
-  const parsed = parseJsonObject(bodyText);
-  const continued = typeof parsed?.continued === 'boolean' ? parsed.continued : null;
-  console.log(
-    `scheduled: sharded_continuation_start step=${String(body.step)} continued=${continued === null ? '-' : continued ? 1 : 0}`,
-  );
+  if (shouldLogScheduledRefresh(env)) {
+    const parsed = parseJsonObject(bodyText);
+    const continued = typeof parsed?.continued === 'boolean' ? parsed.continued : null;
+    console.log(
+      `scheduled: sharded_continuation_start step=${String(body.step)} continued=${continued === null ? '-' : continued ? 1 : 0}`,
+    );
+  }
 }
 
 async function refreshHomepageSnapshotViaService(
@@ -668,11 +724,15 @@ async function runScheduledCheckBatchViaService(
 
   const traceScheduledRefresh = shouldTraceScheduledRefresh(env);
   const traceId = traceScheduledRefresh ? crypto.randomUUID() : null;
+  const returnRuntimeUpdatesForSplit =
+    context.runtimeFragmentsOnly === true && context.splitRuntimeFragmentWrites === true;
   const headers: Record<string, string> = {
     Authorization: `Bearer ${env.ADMIN_TOKEN}`,
     'X-Uptimer-Internal-Format': INTERNAL_PROTOCOL_FORMAT,
     'Content-Type': 'application/json; charset=utf-8',
-    ...(context.runtimeFragmentsOnly ? { 'X-Uptimer-Runtime-Fragments-Only': '1' } : {}),
+    ...(context.runtimeFragmentsOnly && !returnRuntimeUpdatesForSplit
+      ? { 'X-Uptimer-Runtime-Fragments-Only': '1' }
+      : {}),
   };
   if (traceScheduledRefresh) {
     headers['X-Uptimer-Trace'] = '1';
@@ -699,7 +759,13 @@ async function runScheduledCheckBatchViaService(
         allow_notifications: context.allowNotifications || undefined,
       }),
     }),
-    INTERNAL_SCHEDULED_CHECK_BATCH_TIMEOUT_MS,
+    readBoundedPositiveIntegerEnv(
+      env,
+      'UPTIMER_INTERNAL_SCHEDULED_CHECK_BATCH_TIMEOUT_MS',
+      INTERNAL_SCHEDULED_CHECK_BATCH_TIMEOUT_MS,
+      5_000,
+      120_000,
+    ),
     'scheduled check batch service',
     signal,
   );
@@ -1070,11 +1136,40 @@ export async function runExclusivePersistedMonitorBatch(opts: {
   };
   onPersistedMonitor?: (completed: CompletedDueMonitor) => void;
   trace?: Trace;
+  trustSchedulerLease?: boolean;
 }): Promise<MonitorBatchExecutionResult> {
   const ids = normalizePositiveIntegerIds(opts.ids);
   opts.trace?.setLabel('batch_ids', ids.length);
   if (ids.length === 0) {
     return createEmptyMonitorBatchExecutionResult();
+  }
+
+  if (opts.trustSchedulerLease) {
+    opts.trace?.setLabel('batch_lock', 'trusted_scheduler_lease');
+    const rows = opts.trace
+      ? await opts.trace.timeAsync(
+          'batch_list_pending_rows',
+          async () => await listPendingMonitorRowsByIds(opts.db, ids, opts.checkedAt),
+        )
+      : await listPendingMonitorRowsByIds(opts.db, ids, opts.checkedAt);
+    opts.trace?.setLabel('batch_pending_rows', rows.length);
+    if (rows.length === 0) {
+      return createEmptyMonitorBatchExecutionResult();
+    }
+    return await runPersistedMonitorBatch({
+      db: opts.db,
+      rows,
+      checkedAt: opts.checkedAt,
+      stateMachineConfig: opts.stateMachineConfig,
+      ...(opts.suppressedMonitorIds ? { suppressedMonitorIds: opts.suppressedMonitorIds } : {}),
+      ...(opts.onPersistedMonitor ? { onPersistedMonitor: opts.onPersistedMonitor } : {}),
+      ...(opts.trace ? { trace: opts.trace } : {}),
+      beforePersist: () => {
+        if (opts.abortSignal?.aborted) {
+          throw new LeaseLostError('scheduled batch: trusted scheduler lease aborted by caller');
+        }
+      },
+    });
   }
 
   const now = Math.floor(Date.now() / 1000);
@@ -1671,9 +1766,11 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
     runtimeSnapshotBaseline?: PublicMonitorRuntimeSnapshot,
   ) => {
     if (shouldSkipScheduledHomepageRefreshForShardedSnapshots(env)) {
-      console.log(
-        `scheduled: homepage_refresh_skip reason=sharded_public_snapshots runtime_updates=${runtimeUpdates?.length ?? 0}`,
-      );
+      if (shouldLogScheduledRefresh(env)) {
+        console.log(
+          `scheduled: homepage_refresh_skip reason=sharded_public_snapshots runtime_updates=${runtimeUpdates?.length ?? 0}`,
+        );
+      }
       return shouldUseScheduledShardedContinuation(env)
         ? startShardedPublicSnapshotContinuationViaService(env, { refreshRuntimeFragments: false })
             .catch((err) => {
@@ -1803,6 +1900,8 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
         ? chunkDueMonitorRows(due, internalScheduledBatchSize)
         : null;
     const activeRuntimeFragmentPipeline = useRuntimeFragmentPipeline && serviceBatchRows !== null;
+    const splitRuntimeFragmentWrites =
+      activeRuntimeFragmentPipeline && shouldSplitInternalCheckBatchFragmentWrites(env);
 
     const inlineNotificationHandler =
       notificationsModule && notify
@@ -1847,6 +1946,7 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
                 stateMachineConfig,
                 allowNotifications: Boolean(notify),
                 ...(activeRuntimeFragmentPipeline ? { runtimeFragmentsOnly: true } : {}),
+                ...(splitRuntimeFragmentWrites ? { splitRuntimeFragmentWrites: true } : {}),
               }, schedulerLease.signal);
             } catch (err) {
               schedulerLease.assertHeld('dispatching inline fallback for service batch');
@@ -1886,6 +1986,19 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
         checksDurMs += batch.checksDurMs;
         persistDurMs += batch.persistDurMs;
         mergeBatchStats(aggregateStats, batch.stats);
+      }
+
+      if (splitRuntimeFragmentWrites && runtimeUpdates.length > 0) {
+        const runtimeFragmentWriteStart = performance.now();
+        try {
+          await writeRuntimeUpdateFragmentsViaService(env, runtimeUpdates, schedulerLease.signal);
+          runtimeUpdates = [];
+          runtimeSnapshotDurMs = performance.now() - runtimeFragmentWriteStart;
+        } catch (err) {
+          console.warn('runtime update fragments write: service write failed', err);
+          requiresRuntimeSnapshotRebuild = true;
+          requiresFullHomepageRefresh = true;
+        }
       }
     } else {
       const batch = await runPersistedMonitorBatch({
@@ -1932,7 +2045,7 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
       console.error(
         `scheduled: ${aggregateStats.rejectedCount}/${due.length} monitors failed at ${checkedAt} attempts=${aggregateStats.attemptTotal} http=${aggregateStats.httpCount} tcp=${aggregateStats.tcpCount} assertions=${aggregateStats.assertionCount} down=${aggregateStats.downCount} unknown=${aggregateStats.unknownCount} batch_mode=${batchMode} batch_count=${batchCount} dur_setup=${setupDurMs.toFixed(2)} dur_checks=${checksDurMs.toFixed(2)} dur_persist=${persistDurMs.toFixed(2)} dur_batch=${batchWallDurMs.toFixed(2)} dur_runtime=${runtimeSnapshotDurMs.toFixed(2)} dur_total=${(performance.now() - totalStart).toFixed(2)}`,
       );
-    } else {
+    } else if (shouldLogScheduledRefresh(env)) {
       console.log(
         `scheduled: processed ${aggregateStats.processedCount} monitors at ${checkedAt} attempts=${aggregateStats.attemptTotal} http=${aggregateStats.httpCount} tcp=${aggregateStats.tcpCount} assertions=${aggregateStats.assertionCount} down=${aggregateStats.downCount} unknown=${aggregateStats.unknownCount} batch_mode=${batchMode} batch_count=${batchCount} dur_setup=${setupDurMs.toFixed(2)} dur_checks=${checksDurMs.toFixed(2)} dur_persist=${persistDurMs.toFixed(2)} dur_batch=${batchWallDurMs.toFixed(2)} dur_runtime=${runtimeSnapshotDurMs.toFixed(2)} dur_total=${(performance.now() - totalStart).toFixed(2)}`,
       );

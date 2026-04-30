@@ -1,3 +1,5 @@
+import { z } from 'zod';
+
 import { AppError } from '../middleware/errors';
 import type { Trace } from '../observability/trace';
 import { acquireLease, releaseLease } from '../scheduler/lock';
@@ -10,9 +12,18 @@ import {
   publicHomepageStoredRenderArtifactSchema,
   type StoredPublicHomepageRenderArtifact,
 } from '../schemas/public-homepage';
+import type { PublicSnapshotFragmentRow } from './public-fragments';
 
 const SNAPSHOT_KEY = 'homepage';
 const SNAPSHOT_ARTIFACT_KEY = 'homepage:artifact';
+export const HOMEPAGE_ARTIFACT_MONITOR_FRAGMENTS_KEY = 'homepage:artifact:monitors';
+
+const homepageArtifactMonitorFragmentSchema = z.object({
+  id: z.number().int().positive(),
+  name: z.string(),
+  group_name: z.string().min(1).nullable(),
+  card_html: z.string().min(1),
+});
 const MAX_AGE_SECONDS = 60;
 const MAX_STALE_SECONDS = 10 * 60;
 const REFRESH_LOCK_NAME = 'snapshot:homepage:refresh';
@@ -21,7 +32,7 @@ const REFRESH_LOCK_RENEW_INTERVAL_MS = 15_000;
 const REFRESH_LOCK_RENEW_MIN_REMAINING_SECONDS = 20;
 const FUTURE_SNAPSHOT_TOLERANCE_SECONDS = 60;
 const READ_SNAPSHOT_SQL = `
-  SELECT generated_at, body_json
+  SELECT generated_at, updated_at, body_json
   FROM public_snapshots
   WHERE key = ?1
 `;
@@ -281,9 +292,149 @@ function renderMaintenanceCard(
   return parts.join('');
 }
 
+function renderHomepageMonitorPreloadCard(
+  monitor: PublicHomepageResponse['monitors'][number],
+  formatTimestamp: (tsSec: number) => string,
+): string {
+  const uptimePct =
+    typeof monitor.uptime_30d?.uptime_pct === 'number'
+      ? `${monitor.uptime_30d.uptime_pct.toFixed(3)}%`
+      : '-';
+  const status = monitor.status;
+  const statusLabel = escapeHtml(status);
+  const lastCheckedLabel = monitor.last_checked_at
+    ? `Last checked: ${formatTimestamp(monitor.last_checked_at)}`
+    : 'Never checked';
+
+  return `<article class="card"><div class="row"><div class="lhs"><span class="dot dot-${status}"></span><div class="ut"><div class="mn">${escapeHtml(monitor.name)}</div><div class="mt">${escapeHtml(monitor.type)}</div></div></div><div class="rhs"><span class="up">${escapeHtml(uptimePct)}</span><span class="sb sb-${status}">${statusLabel}</span></div></div><div><div class="lbl">Availability (30d)</div><div class="strip">${buildUptimeStripSvg(monitor.uptime_day_strip)}</div></div><div><div class="lbl">Recent checks</div><div class="strip">${buildHeartbeatStripSvg(monitor.heartbeat_strip)}</div></div><div class="ft">${lastCheckedLabel}</div></article>`;
+}
+
+export function renderHomepageMonitorPreloadCardFragment(
+  monitor: PublicHomepageResponse['monitors'][number],
+): string {
+  const timeCache = new Map<number, string>();
+  const formatTimestamp = (tsSec: number) => escapeHtml(formatTime(tsSec, timeCache));
+  return renderHomepageMonitorPreloadCard(monitor, formatTimestamp);
+}
+
+export type HomepageArtifactMonitorFragment = z.infer<
+  typeof homepageArtifactMonitorFragmentSchema
+>;
+
+export type HomepageArtifactMonitorFragmentParseResult = {
+  cardHtmlByMonitorId: Map<number, string>;
+  monitorNameById: Map<number, string>;
+  invalidCount: number;
+  staleCount: number;
+  missingCount: number;
+};
+
+export function buildHomepageArtifactMonitorFragmentWrites(
+  payload: PublicHomepageResponse,
+  updatedAt: number,
+  monitorIds?: Iterable<number>,
+): Array<{
+  snapshotKey: string;
+  fragmentKey: string;
+  generatedAt: number;
+  bodyJson: string;
+  updatedAt: number;
+}> {
+  const selectedMonitorIds = monitorIds ? new Set(monitorIds) : null;
+  const writes: Array<{
+    snapshotKey: string;
+    fragmentKey: string;
+    generatedAt: number;
+    bodyJson: string;
+    updatedAt: number;
+  }> = [];
+
+  for (const monitor of payload.monitors) {
+    if (selectedMonitorIds && !selectedMonitorIds.has(monitor.id)) {
+      continue;
+    }
+    writes.push({
+      snapshotKey: HOMEPAGE_ARTIFACT_MONITOR_FRAGMENTS_KEY,
+      fragmentKey: `monitor:${monitor.id}`,
+      generatedAt: payload.generated_at,
+      bodyJson: JSON.stringify({
+        id: monitor.id,
+        name: monitor.name,
+        group_name: monitor.group_name,
+        card_html: renderHomepageMonitorPreloadCardFragment(monitor),
+      }),
+      updatedAt,
+    });
+  }
+
+  return writes;
+}
+
+function parseHomepageArtifactMonitorFragmentKey(fragmentKey: string): number | null {
+  if (!fragmentKey.startsWith('monitor:')) {
+    return null;
+  }
+  const parsed = Number.parseInt(fragmentKey.slice('monitor:'.length), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+export function parseHomepageArtifactMonitorFragmentRows(
+  rows: readonly PublicSnapshotFragmentRow[],
+  snapshot: PublicHomepageResponse,
+): HomepageArtifactMonitorFragmentParseResult {
+  const cardHtmlByMonitorId = new Map<number, string>();
+  const monitorNameById = new Map<number, string>();
+  const expectedMonitorIds = new Set(snapshot.monitors.map((monitor) => monitor.id));
+  let invalidCount = 0;
+  let staleCount = 0;
+
+  for (const row of rows) {
+    const monitorId = parseHomepageArtifactMonitorFragmentKey(row.fragment_key);
+    if (monitorId === null || !expectedMonitorIds.has(monitorId)) {
+      invalidCount += 1;
+      continue;
+    }
+    if (row.generated_at !== snapshot.generated_at) {
+      staleCount += 1;
+      continue;
+    }
+
+    let raw: unknown;
+    try {
+      raw = JSON.parse(row.body_json) as unknown;
+    } catch {
+      invalidCount += 1;
+      continue;
+    }
+    const parsed = homepageArtifactMonitorFragmentSchema.safeParse(raw);
+    if (!parsed.success || parsed.data.id !== monitorId) {
+      invalidCount += 1;
+      continue;
+    }
+    cardHtmlByMonitorId.set(monitorId, parsed.data.card_html);
+    monitorNameById.set(monitorId, parsed.data.name);
+  }
+
+  let missingCount = 0;
+  for (const monitorId of expectedMonitorIds) {
+    if (!cardHtmlByMonitorId.has(monitorId)) {
+      missingCount += 1;
+    }
+  }
+
+  return {
+    cardHtmlByMonitorId,
+    monitorNameById,
+    invalidCount,
+    staleCount,
+    missingCount,
+  };
+}
+
 function renderPreload(
   snapshot: PublicHomepageResponse,
   monitorNameById?: ReadonlyMap<number, string>,
+  monitorCardHtmlById?: ReadonlyMap<number, string>,
 ): string {
   const overall = snapshot.overall_status;
   const siteTitle = snapshot.site_title;
@@ -311,18 +462,9 @@ function renderPreload(
   for (const [groupName, groupMonitors] of groups.entries()) {
     const monitorCardsParts: string[] = [];
     for (const monitor of groupMonitors) {
-      const uptimePct =
-        typeof monitor.uptime_30d?.uptime_pct === 'number'
-          ? `${monitor.uptime_30d.uptime_pct.toFixed(3)}%`
-          : '-';
-      const status = monitor.status;
-      const statusLabel = escapeHtml(status);
-      const lastCheckedLabel = monitor.last_checked_at
-        ? `Last checked: ${formatTimestamp(monitor.last_checked_at)}`
-        : 'Never checked';
-
       monitorCardsParts.push(
-        `<article class="card"><div class="row"><div class="lhs"><span class="dot dot-${status}"></span><div class="ut"><div class="mn">${escapeHtml(monitor.name)}</div><div class="mt">${escapeHtml(monitor.type)}</div></div></div><div class="rhs"><span class="up">${escapeHtml(uptimePct)}</span><span class="sb sb-${status}">${statusLabel}</span></div></div><div><div class="lbl">Availability (30d)</div><div class="strip">${buildUptimeStripSvg(monitor.uptime_day_strip)}</div></div><div><div class="lbl">Recent checks</div><div class="strip">${buildHeartbeatStripSvg(monitor.heartbeat_strip)}</div></div><div class="ft">${lastCheckedLabel}</div></article>`,
+        monitorCardHtmlById?.get(monitor.id) ??
+          renderHomepageMonitorPreloadCard(monitor, formatTimestamp),
       );
     }
 
@@ -374,20 +516,28 @@ function renderPreload(
   return `<div class="hp"><header class="uh"><div class="uw uhw"><div class="ut"><div class="un">${escapeHtml(siteTitle)}</div>${descriptionHtml}</div><span class="sb sb-${overall}">${escapeHtml(overall)}</span></div></header><main class="uw um"><section class="bn"><div class="bt">${escapeHtml(bannerTitle)}</div><div class="bu">Updated: ${formatTimestamp(generatedAt)}</div></section>${maintenanceSection}${incidentSection}<section class="sec"><h3 class="sh">Services</h3>${groupedMonitorsParts.join('')}</section><section class="sec ih"><div><h3 class="sh">Incident History</h3>${incidentHistory}</div><div><h3 class="sh">Maintenance History</h3>${maintenanceHistory}</div></section></main></div>`;
 }
 
-export function buildHomepageRenderArtifact(
-  snapshot: PublicHomepageResponse,
-): StoredPublicHomepageRenderArtifact {
-  const fullSnapshot: PublicHomepageResponse = {
+function toFullHomepageSnapshot(snapshot: PublicHomepageResponse): PublicHomepageResponse {
+  return {
     ...snapshot,
     bootstrap_mode: 'full',
     monitor_count_total: snapshot.monitors.length,
   };
+}
+
+function buildHomepageRenderArtifactWithPreloadOptions(
+  snapshot: PublicHomepageResponse,
+  opts: {
+    monitorNameById?: ReadonlyMap<number, string>;
+    monitorCardHtmlById?: ReadonlyMap<number, string>;
+  } = {},
+): StoredPublicHomepageRenderArtifact {
+  const fullSnapshot = toFullHomepageSnapshot(snapshot);
   const needsMonitorNames =
     fullSnapshot.maintenance_windows.active.length > 0 ||
     fullSnapshot.maintenance_windows.upcoming.length > 0 ||
     fullSnapshot.maintenance_history_preview !== null;
   const allMonitorNames = needsMonitorNames
-    ? new Map(fullSnapshot.monitors.map((monitor) => [monitor.id, monitor.name]))
+    ? opts.monitorNameById ?? new Map(fullSnapshot.monitors.map((monitor) => [monitor.id, monitor.name]))
     : undefined;
   const metaTitle = normalizeSnapshotText(fullSnapshot.site_title, 'Uptimer');
   const fallbackDescription = normalizeSnapshotText(
@@ -400,10 +550,41 @@ export function buildHomepageRenderArtifact(
 
   return {
     generated_at: fullSnapshot.generated_at,
-    preload_html: `<div id="uptimer-preload">${renderPreload(fullSnapshot, allMonitorNames)}</div>`,
+    preload_html: `<div id="uptimer-preload">${renderPreload(
+      fullSnapshot,
+      allMonitorNames,
+      opts.monitorCardHtmlById,
+    )}</div>`,
     snapshot: fullSnapshot,
     meta_title: metaTitle,
     meta_description: metaDescription,
+  };
+}
+
+export function buildHomepageRenderArtifact(
+  snapshot: PublicHomepageResponse,
+): StoredPublicHomepageRenderArtifact {
+  return buildHomepageRenderArtifactWithPreloadOptions(snapshot);
+}
+
+export function buildHomepageRenderArtifactFromMonitorFragments(
+  snapshot: PublicHomepageResponse,
+  rows: readonly PublicSnapshotFragmentRow[],
+): { artifact: StoredPublicHomepageRenderArtifact | null } & HomepageArtifactMonitorFragmentParseResult {
+  const parsed = parseHomepageArtifactMonitorFragmentRows(rows, snapshot);
+  if (parsed.missingCount > 0 || parsed.staleCount > 0 || parsed.invalidCount > 0) {
+    return {
+      ...parsed,
+      artifact: null,
+    };
+  }
+
+  return {
+    ...parsed,
+    artifact: buildHomepageRenderArtifactWithPreloadOptions(snapshot, {
+      monitorNameById: parsed.monitorNameById,
+      monitorCardHtmlById: parsed.cardHtmlByMonitorId,
+    }),
   };
 }
 
@@ -487,7 +668,7 @@ function safeJsonParse(text: string): unknown | null {
 async function readSnapshotRow(
   db: D1Database,
   key: string,
-): Promise<{ generated_at: number; body_json: string } | null> {
+): Promise<{ generated_at: number; updated_at?: number | null; body_json: string } | null> {
   try {
     const cached = readSnapshotStatementByDb.get(db);
     const statement = cached ?? db.prepare(READ_SNAPSHOT_SQL);
@@ -497,7 +678,7 @@ async function readSnapshotRow(
 
     return await statement
       .bind(key)
-      .first<{ generated_at: number; body_json: string }>();
+      .first<{ generated_at: number; updated_at?: number | null; body_json: string }>();
   } catch (err) {
     console.warn('homepage snapshot: read failed', err);
     return null;
@@ -514,14 +695,15 @@ async function readHomepageArtifactSnapshotRow(db: D1Database) {
 
 async function readSnapshotRowsByPriority(
   db: D1Database,
-): Promise<Array<{ generated_at: number; body_json: string }>> {
+): Promise<Array<{ generated_at: number; updated_at?: number | null; body_json: string }>> {
   const [artifactRow, homepageRow] = await Promise.all([
     readHomepageArtifactSnapshotRow(db),
     readHomepageSnapshotRow(db),
   ]);
 
   return [artifactRow, homepageRow].filter(
-    (row): row is { generated_at: number; body_json: string } => row !== null,
+    (row): row is { generated_at: number; updated_at?: number | null; body_json: string } =>
+      row !== null,
   );
 }
 
@@ -572,11 +754,12 @@ function normalizeHomepageArtifactBodyJson(bodyJson: string): string | null {
 }
 
 function readSnapshotValueFromRows<T>(opts: {
-  rows: ReadonlyArray<{ generated_at: number; body_json: string }>;
+  rows: ReadonlyArray<{ generated_at: number; updated_at?: number | null; body_json: string }>;
   now: number;
   maxAgeSeconds: number;
   warning: string;
   normalize: (bodyJson: string) => T | null;
+  ageFromUpdatedAt?: boolean;
 }): { value: T; age: number } | null {
   let freshest: { value: T; age: number } | null = null;
 
@@ -584,7 +767,10 @@ function readSnapshotValueFromRows<T>(opts: {
     if (row.generated_at > opts.now + FUTURE_SNAPSHOT_TOLERANCE_SECONDS) {
       continue;
     }
-    const age = Math.max(0, opts.now - row.generated_at);
+    const ageBase = opts.ageFromUpdatedAt && typeof row.updated_at === 'number'
+      ? row.updated_at
+      : row.generated_at;
+    const age = Math.max(0, opts.now - ageBase);
     if (age > opts.maxAgeSeconds) {
       continue;
     }
@@ -727,6 +913,7 @@ export async function readHomepageSnapshotArtifactJson(
     maxAgeSeconds: MAX_AGE_SECONDS,
     warning: 'homepage snapshot: invalid render payload',
     normalize: normalizeHomepageArtifactBodyJson,
+    ageFromUpdatedAt: true,
   });
   return snapshot ? { bodyJson: snapshot.value, age: snapshot.age } : null;
 }
@@ -748,6 +935,7 @@ export async function readStaleHomepageSnapshotArtifact(
       }
       return readStoredHomepageSnapshotRender(parsed);
     },
+    ageFromUpdatedAt: true,
   });
   return snapshot ? { data: snapshot.value, age: snapshot.age } : null;
 }
@@ -763,6 +951,7 @@ export async function readStaleHomepageSnapshotArtifactJson(
     maxAgeSeconds: MAX_STALE_SECONDS,
     warning: 'homepage snapshot: invalid stale render payload',
     normalize: normalizeHomepageArtifactBodyJson,
+    ageFromUpdatedAt: true,
   });
   return snapshot ? { bodyJson: snapshot.value, age: snapshot.age } : null;
 }

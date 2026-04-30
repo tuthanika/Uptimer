@@ -5,6 +5,7 @@ import {
 } from './runtime-fragments-refresh-core';
 import {
   assembleShardedPublicSnapshot,
+  publishHomepageArtifactSnapshotFromPublishedHomepage,
   seedShardedPublicSnapshotFragments,
   type ShardedPublicSnapshotAssemblyMode,
   type ShardedPublicSnapshotKind,
@@ -20,7 +21,8 @@ export type ShardedPublicSnapshotContinuationStep =
       monitorOffset?: number;
       monitorLimit?: number;
     }
-  | { step: 'assemble'; kind: ShardedPublicSnapshotKind };
+  | { step: 'assemble'; kind: ShardedPublicSnapshotKind }
+  | { step: 'artifact'; kind: 'homepage'; generatedAt?: number };
 
 export type ShardedPublicSnapshotContinuationResult = {
   ok: boolean;
@@ -35,6 +37,7 @@ export type ShardedPublicSnapshotContinuationResult = {
   artifactPublished?: boolean;
   kind?: ShardedPublicSnapshotKind;
   part?: Exclude<ShardedPublicSnapshotSeedPart, 'all'>;
+  generatedAt?: number;
   monitorCount?: number;
   monitorOffset?: number;
   monitorLimit?: number;
@@ -120,6 +123,7 @@ function diagnosticStepName(step: ShardedPublicSnapshotContinuationStep): string
     return step.updateLimit !== undefined ? `runtime:${step.updateOffset ?? 0}` : 'runtime';
   }
   if (step.step === 'assemble') return `assemble:${step.kind}`;
+  if (step.step === 'artifact') return 'artifact:homepage';
   return `seed:${step.kind}:${step.part}:${step.monitorOffset ?? 0}`;
 }
 
@@ -133,6 +137,7 @@ function logContinuationDiagnostics(
     `step=${result.diagnosticStep ?? result.step}`,
     result.kind ? `kind=${result.kind}` : null,
     result.part ? `part=${result.part}` : null,
+    result.generatedAt !== undefined ? `generated_at=${result.generatedAt}` : null,
     result.monitorOffset !== undefined ? `offset=${result.monitorOffset}` : null,
     result.monitorLimit !== undefined ? `limit=${result.monitorLimit}` : null,
     `ok=${result.ok ? 1 : 0}`,
@@ -225,6 +230,13 @@ function toWireStep(step: ShardedPublicSnapshotContinuationStep): Record<string,
   }
   if (step.step === 'assemble') {
     return { step: step.step, kind: step.kind };
+  }
+  if (step.step === 'artifact') {
+    return {
+      step: step.step,
+      kind: step.kind,
+      ...(step.generatedAt !== undefined ? { generated_at: step.generatedAt } : {}),
+    };
   }
   return {
     step: step.step,
@@ -424,6 +436,48 @@ export async function runShardedPublicSnapshotContinuation(opts: {
     return continuationResult;
   }
 
+  if (opts.step.step === 'artifact') {
+    if (!shouldPublishShardedSnapshots(opts.env)) {
+      const skippedResult: ShardedPublicSnapshotContinuationResult = {
+        ok: true,
+        step: 'artifact',
+        kind: 'homepage',
+        continued: false,
+        skipped: 'artifact_publish_disabled',
+        ...(diagnostics ? { diagnosticStep, totalMs: Date.now() - startedAt } : {}),
+      };
+      logContinuationDiagnostics(opts.env, skippedResult);
+      return skippedResult;
+    }
+    const operationStartedAt = diagnostics ? Date.now() : 0;
+    const result = await publishHomepageArtifactSnapshotFromPublishedHomepage({
+      env: opts.env,
+      now: opts.now,
+      ...(opts.step.generatedAt !== undefined ? { generatedAt: opts.step.generatedAt } : {}),
+    });
+    const operationMs = diagnostics ? Date.now() - operationStartedAt : undefined;
+    const continuationResult: ShardedPublicSnapshotContinuationResult = {
+      ok: result.ok,
+      step: 'artifact',
+      kind: 'homepage',
+      ...(result.generatedAt !== undefined ? { generatedAt: result.generatedAt } : {}),
+      monitorCount: result.monitorCount,
+      published: result.published,
+      artifactPublished: result.artifactPublished,
+      writeCount: result.writeCount,
+      continued: false,
+      ...(result.skip ? { skipped: result.skip } : {}),
+      ...(result.error ? { error: true } : {}),
+      ...(result.errorName ? { errorName: result.errorName } : {}),
+      ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      ...(diagnostics
+        ? { diagnosticStep, operationMs: operationMs ?? 0, totalMs: Date.now() - startedAt }
+        : {}),
+    };
+    logContinuationDiagnostics(opts.env, continuationResult);
+    return continuationResult;
+  }
+
   if (!canAssembleShardedSnapshots(opts.env)) {
     const skippedResult: ShardedPublicSnapshotContinuationResult = {
       ok: true,
@@ -436,24 +490,39 @@ export async function runShardedPublicSnapshotContinuation(opts: {
     logContinuationDiagnostics(opts.env, skippedResult);
     return skippedResult;
   }
+  const publishShardedSnapshots = shouldPublishShardedSnapshots(opts.env);
   const operationStartedAt = diagnostics ? Date.now() : 0;
   const result = await assembleShardedPublicSnapshot({
     env: opts.env,
     kind: opts.step.kind,
     mode: readAssemblyMode(opts.env),
     now: opts.now,
-    publish: shouldPublishShardedSnapshots(opts.env),
+    publish: publishShardedSnapshots,
+    publishArtifact: false,
   });
   const operationMs = diagnostics ? Date.now() - operationStartedAt : undefined;
+  const nextStep: ShardedPublicSnapshotContinuationStep | null =
+    publishShardedSnapshots && result.ok && result.assembled && result.kind === 'homepage'
+      ? {
+          step: 'artifact',
+          kind: 'homepage',
+          ...(result.generatedAt !== undefined ? { generatedAt: result.generatedAt } : {}),
+        }
+      : null;
+  const queueStartedAt = diagnostics ? Date.now() : 0;
+  const continued = queueContinuation(opts.env, opts.ctx, nextStep);
+  const queueMs = diagnostics ? Date.now() - queueStartedAt : undefined;
   const continuationResult: ShardedPublicSnapshotContinuationResult = {
     ok: result.ok,
     step: 'assemble',
     assembled: result.assembled,
     kind: result.kind,
+    ...(result.generatedAt !== undefined ? { generatedAt: result.generatedAt } : {}),
     monitorCount: result.monitorCount,
     invalidCount: result.invalidCount,
     staleCount: result.staleCount,
-    continued: false,
+    continued,
+    ...(continued && nextStep ? { nextStep } : {}),
     ...(result.skip ? { skipped: result.skip } : {}),
     ...(result.published !== undefined ? { published: result.published } : {}),
     ...(result.artifactPublished !== undefined
@@ -464,7 +533,12 @@ export async function runShardedPublicSnapshotContinuation(opts: {
     ...(result.errorName ? { errorName: result.errorName } : {}),
     ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     ...(diagnostics
-      ? { diagnosticStep, operationMs: operationMs ?? 0, totalMs: Date.now() - startedAt }
+      ? {
+          diagnosticStep,
+          operationMs: operationMs ?? 0,
+          queueMs: queueMs ?? 0,
+          totalMs: Date.now() - startedAt,
+        }
       : {}),
   };
   logContinuationDiagnostics(opts.env, continuationResult);

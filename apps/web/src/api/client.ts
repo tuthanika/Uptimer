@@ -45,7 +45,7 @@ const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? '/api/
 const PUBLIC_CACHE_TTL_MS = 30_000;
 const publicCache = new Map<string, { at: number; value: unknown }>();
 
-const LS_PUBLIC_HOMEPAGE_KEY = 'uptimer_public_homepage_snapshot_v1';
+const LS_PUBLIC_HOMEPAGE_KEY = 'uptimer_public_homepage_snapshot_v2';
 const LS_PUBLIC_STATUS_KEY = 'uptimer_public_status_snapshot_v1';
 
 type PersistedHomepageCache = {

@@ -273,7 +273,7 @@ export function UptimeBar30d({
               const day = slot.day;
               return day ? (
                 <button
-                  key={day.day_start_at}
+                  key={`day-${day.day_start_at}-${index}`}
                   type="button"
                   aria-label={`${t('uptime.aria_prefix')}: ${formatDay(day.day_start_at, timeZone, locale)}`}
                   className="h-full w-full bg-transparent focus:outline-none"

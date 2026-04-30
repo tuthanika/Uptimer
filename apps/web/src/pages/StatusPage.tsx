@@ -369,8 +369,8 @@ export function StatusPage() {
   const homepageQuery = useQuery({
     queryKey: ['homepage'],
     queryFn: fetchHomepage,
-    staleTime: 60_000,
-    refetchInterval: 60_000,
+    staleTime: 30_000,
+    refetchInterval: 30_000,
     // Keep a recent injected homepage bootstrap stable through the current monitor window.
     // Immediate mount refetch can temporarily downgrade recent artifact data to UNKNOWN
     // before the next scheduled check has refreshed monitor_state/snapshots.
@@ -379,7 +379,7 @@ export function StatusPage() {
       if (!data || typeof data.generated_at !== 'number') {
         return true;
       }
-      return Date.now() - data.generated_at * 1000 > 2 * 60_000;
+      return Date.now() - data.generated_at * 1000 > 60_000;
     },
   });
 

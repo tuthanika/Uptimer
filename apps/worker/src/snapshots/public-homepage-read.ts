@@ -522,6 +522,10 @@ function snapshotCandidateAgeSeconds(candidate: SnapshotCandidate, now: number):
   return Math.max(0, now - candidate.generatedAt);
 }
 
+function snapshotCandidateUpdatedAgeSeconds(candidate: SnapshotCandidate, now: number): number {
+  return Math.max(0, now - candidate.updatedAt);
+}
+
 async function readRefreshSnapshotRows(
   db: D1Database,
 ): Promise<SnapshotRefreshRow[]> {
@@ -764,7 +768,9 @@ async function readPreferredSnapshotCandidate(opts: {
     return { row: null, age: null, invalid: false };
   }
 
-  const age = snapshotCandidateAgeSeconds(candidate, opts.now);
+  const age = opts.key === SNAPSHOT_ARTIFACT_KEY
+    ? snapshotCandidateUpdatedAgeSeconds(candidate, opts.now)
+    : snapshotCandidateAgeSeconds(candidate, opts.now);
   if (age > opts.maxAgeSeconds) {
     return { row: null, age, invalid: false };
   }
@@ -846,7 +852,7 @@ async function readHomepageArtifactJsonViaCandidates(
     .filter(
       (candidate) =>
         !isFutureSnapshotCandidate(candidate, now) &&
-        snapshotCandidateAgeSeconds(candidate, now) <= maxAgeSeconds,
+        snapshotCandidateUpdatedAgeSeconds(candidate, now) <= maxAgeSeconds,
     )
     .sort(compareArtifactCandidates);
 
@@ -873,7 +879,7 @@ async function readHomepageArtifactJsonViaCandidates(
 
     return {
       bodyJson: result.row.bodyJson,
-      age: snapshotCandidateAgeSeconds(
+      age: snapshotCandidateUpdatedAgeSeconds(
         {
           key: candidate.key,
           generatedAt: result.row.generatedAt,

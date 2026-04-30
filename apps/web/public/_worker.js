@@ -684,10 +684,10 @@ const HOMEPAGE_PRELOAD_STYLE_TAG = `<style id="uptimer-preload-style">
 @media (min-width:640px){#uptimer-preload .grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 html.dark #uptimer-preload{background:#0f172a;color:#f8fafc}
 html.dark #uptimer-preload .uh{background:rgba(15,23,42,.95);border-bottom-color:rgba(51,65,85,.9)}
-html.dark #uptimer-preload .ud,#uptimer-preload .sgt{color:#cbd5e1}
+html.dark #uptimer-preload .ud,html.dark #uptimer-preload .sgt{color:#cbd5e1}
 html.dark #uptimer-preload .bn,html.dark #uptimer-preload .card{background:#1e293b;border-color:rgba(51,65,85,.95);box-shadow:none}
 html.dark #uptimer-preload .bt{color:#cbd5e1}
-html.dark #uptimer-preload .bu,#uptimer-preload .sgc,#uptimer-preload .up,#uptimer-preload .lbl,#uptimer-preload .ft{color:#94a3b8}
+html.dark #uptimer-preload .bu,html.dark #uptimer-preload .sgc,html.dark #uptimer-preload .up,html.dark #uptimer-preload .lbl,html.dark #uptimer-preload .ft{color:#94a3b8}
 html.dark #uptimer-preload .mt{color:#94a3b8}
 html.dark #uptimer-preload .strip{background:#334155}
 html.dark #uptimer-preload .ih{border-top-color:#334155}
